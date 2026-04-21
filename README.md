@@ -14,6 +14,21 @@ The app stores uploaded files by walk date and serves a single analysis view tha
 - stacked distance-aligned charts for altitude, heart rate, blood glucose, basal rate, and bolus events
 - summary metrics for the walk window
 
+## Screenshots
+
+
+### Analysis Charts
+
+![Walkies analysis charts](img/charts.png)
+
+This shows the summary charts for the walk, overlaying the distance travelled with the different observables.
+
+### Map View
+
+![Walkies map view](img/map.png)
+
+The map view shows the heart rate overlaid with the map.  There are hour markers to show progress.
+
 ## Stack
 
 - Backend: FastAPI
