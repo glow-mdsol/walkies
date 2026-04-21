@@ -1,0 +1,44 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task: dev
+
+  dev:
+    desc: Start both servers with auto-reload (backend :8000, frontend :5173)
+    deps: [backend, frontend]
+
+  backend:
+    desc: Start FastAPI dev server on :8000 (auto-reload on file changes)
+    dir: backend
+    cmds:
+      - uv run uvicorn main:app --reload
+
+  frontend:
+    desc: Start Vite dev server on :5173 (HMR)
+    dir: frontend
+    cmds:
+      - npm run dev
+
+  install:
+    desc: Install all dependencies
+    deps: [install:backend, install:frontend]
+
+  install:backend:
+    desc: Install Python dependencies (uv sync)
+    dir: backend
+    cmds:
+      - uv sync
+
+  install:frontend:
+    desc: Install Node dependencies (npm install)
+    dir: frontend
+    cmds:
+      - npm install
+
+  build:
+    desc: Build frontend for production
+    dir: frontend
+    cmds:
+      - npm run build
