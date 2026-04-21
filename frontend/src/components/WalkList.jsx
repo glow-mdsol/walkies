@@ -12,7 +12,7 @@ function fileIcon(name) {
 function WalkCard({ walk, onDeleted }) {
   const handleDelete = async () => {
     if (!confirm(`Delete walk ${walk.name || walk.date} and all its files?`)) return
-    const res = await fetch(`/api/walks/${walk.date}`, { method: 'DELETE' })
+    const res = await fetch(`/api/walks/${encodeURIComponent(walk.id)}`, { method: 'DELETE' })
     if (res.ok) onDeleted()
   }
 
@@ -24,7 +24,7 @@ function WalkCard({ walk, onDeleted }) {
           <span className={walk.name ? 'walk-date-sub' : 'walk-date-main'}>{walk.date}</span>
         </div>
         <div className="walk-actions">
-          <a className="btn-secondary" href={`/api/walks/${walk.date}/analysis`} target="_blank" rel="noreferrer">
+          <a className="btn-secondary" href={`/api/walks/${encodeURIComponent(walk.id)}/analysis`} target="_blank" rel="noreferrer">
             View analysis
           </a>
           <button className="btn-danger" onClick={handleDelete}>Delete</button>
@@ -51,7 +51,7 @@ export default function WalkList({ walks, onDeleted }) {
     <section className="walk-list">
       <h2>Walks</h2>
       {walks.map(w => (
-        <WalkCard key={w.date} walk={w} onDeleted={onDeleted} />
+        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} />
       ))}
     </section>
   )

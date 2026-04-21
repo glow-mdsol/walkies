@@ -2,6 +2,7 @@ import json
 import csv
 import html
 import math
+import re
 import shutil
 import struct
 from datetime import date as date_type, datetime, timedelta, timezone
@@ -36,8 +37,98 @@ def _parse_date(date_str: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
 
 
-def _fit_start_date(data: bytes) -> str | None:
-    """Return the start date (YYYY-MM-DD) from a FIT file, or None."""
+def _slugify(text: str) -> str:
+    slug = re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')
+    return slug or 'walk'
+
+
+def _walk_date_for_dir(walk_dir: Path) -> str:
+    return walk_dir.parent.name if walk_dir.parent != DATA_DIR else walk_dir.name
+
+
+def _iter_walk_dirs() -> list[Path]:
+    walk_dirs: list[Path] = []
+    for date_dir in sorted(DATA_DIR.iterdir(), reverse=True):
+        if not date_dir.is_dir():
+            continue
+        child_dirs = sorted((child for child in date_dir.iterdir() if child.is_dir()), reverse=True)
+        has_files = any(child.is_file() for child in date_dir.iterdir())
+        if has_files:
+            walk_dirs.append(date_dir)
+        walk_dirs.extend(child_dirs)
+    return walk_dirs
+
+
+def _find_walk_dir(walk_id: str) -> Path | None:
+    for walk_dir in _iter_walk_dirs():
+        if walk_dir.name == walk_id:
+            return walk_dir
+    return None
+
+
+def _backfill_walk_meta(walk_dir: Path, meta: dict) -> dict:
+    meta_file = walk_dir / "meta.json"
+    updated_meta = dict(meta)
+    changed = False
+
+    if not updated_meta.get("fit_identity"):
+        fit_files = sorted(walk_dir.glob('*.fit'))
+        if fit_files:
+            fit_identity = _fit_file_identity(fit_files[0].read_bytes())
+            if fit_identity is not None:
+                updated_meta["fit_identity"] = fit_identity
+                changed = True
+
+    if not updated_meta.get("carelink_start_time") or not updated_meta.get("carelink_end_time"):
+        csv_files = sorted(walk_dir.glob('*.csv'))
+        if csv_files:
+            carelink_start_dt, carelink_end_dt = _carelink_time_bounds(csv_files[0])
+            if carelink_start_dt is not None and carelink_end_dt is not None:
+                updated_meta["carelink_start_time"] = carelink_start_dt.isoformat()
+                updated_meta["carelink_end_time"] = carelink_end_dt.isoformat()
+                changed = True
+
+    if changed:
+        meta_file.write_text(json.dumps(updated_meta), encoding="utf-8")
+    return updated_meta
+
+
+def _load_walk_meta(walk_dir: Path) -> dict:
+    date = _walk_date_for_dir(walk_dir)
+    meta_file = walk_dir / "meta.json"
+    meta: dict = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    meta = _backfill_walk_meta(walk_dir, meta)
+    files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != "meta.json")
+    return {
+        "id": walk_dir.name,
+        "date": meta.get("date", date),
+        "name": meta.get("name", ""),
+        "start_time": meta.get("start_time"),
+        "fit_identity": meta.get("fit_identity"),
+        "carelink_start_time": meta.get("carelink_start_time"),
+        "carelink_end_time": meta.get("carelink_end_time"),
+        "files": files,
+    }
+
+
+def _make_walk_id(date: str, fit_start_dt: datetime | None, name: str, date_dir: Path) -> str:
+    time_part = (fit_start_dt or datetime.now(timezone.utc)).strftime("%H%M%S")
+    base = f"{date}-{time_part}-{_slugify(name)}"
+    candidate = base
+    suffix = 2
+    while (date_dir / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _fit_start_datetime(data: bytes) -> datetime | None:
+    """Return the first timestamp from a FIT file, or None."""
     try:
         if len(data) < 12 or data[8:12] != b'.FIT':
             return None
@@ -47,31 +138,31 @@ def _fit_start_date(data: bytes) -> str | None:
         pos = header_size
         end = min(header_size + data_size, len(data))
 
-        # local_num -> [(field_num, field_size, little_endian)]
         definitions: dict = {}
 
         while pos < end:
             header_byte = data[pos]
             pos += 1
 
-            if header_byte & 0x80:  # compressed timestamp header
+            if header_byte & 0x80:
                 local_num = (header_byte >> 5) & 0x03
                 if local_num not in definitions:
                     break
                 pos += sum(fs for _, fs, _ in definitions[local_num])
             else:
                 local_num = header_byte & 0x0F
-                if header_byte & 0x40:  # definition message
-                    pos += 1  # reserved
+                if header_byte & 0x40:
+                    pos += 1
                     little_endian = data[pos] == 0
-                    pos += 3  # architecture + global message number
-                    num_fields = data[pos]; pos += 1
+                    pos += 3
+                    num_fields = data[pos]
+                    pos += 1
                     fields = []
                     for _ in range(num_fields):
                         fields.append((data[pos], data[pos + 1], little_endian))
                         pos += 3
                     definitions[local_num] = fields
-                else:  # data message
+                else:
                     if local_num not in definitions:
                         break
                     ts_value = None
@@ -81,11 +172,132 @@ def _fit_start_date(data: bytes) -> str | None:
                             ts_value = struct.unpack_from(fmt, data, pos)[0]
                         pos += fsize
                     if ts_value is not None:
-                        dt = FIT_EPOCH + timedelta(seconds=ts_value)
-                        return dt.strftime('%Y-%m-%d')
+                        return FIT_EPOCH + timedelta(seconds=ts_value)
     except Exception:
         pass
     return None
+
+
+def _fit_time_bounds(data: bytes) -> tuple[datetime | None, datetime | None]:
+    parsed = _parse_fit_records(data)
+    points = parsed.get('points', [])
+    if points:
+        start_dt = datetime.fromisoformat(points[0]['timestamp_iso'])
+        end_dt = datetime.fromisoformat(points[-1]['timestamp_iso'])
+        return start_dt, end_dt
+
+    start_dt = _fit_start_datetime(data)
+    return start_dt, start_dt
+
+
+def _fit_file_identity(data: bytes) -> str | None:
+    """Return a stable identity from the FIT file_id message, or None."""
+    try:
+        if len(data) < 12 or data[8:12] != b'.FIT':
+            return None
+
+        header_size = data[0]
+        data_size = struct.unpack_from('<I', data, 4)[0]
+        pos = header_size
+        end = min(header_size + data_size, len(data))
+
+        definitions: dict[int, dict] = {}
+
+        while pos < end:
+            header_byte = data[pos]
+            pos += 1
+
+            if header_byte & 0x80:
+                local_num = (header_byte >> 5) & 0x03
+                definition = definitions.get(local_num)
+                if definition is None:
+                    break
+                pos += sum(field_size for _, field_size, _ in definition['fields'])
+                continue
+
+            local_num = header_byte & 0x0F
+            if header_byte & 0x40:
+                if pos + 5 > end:
+                    break
+                pos += 1
+                little_endian = data[pos] == 0
+                pos += 1
+                global_msg_num = _read_u16(data, pos, little_endian)
+                pos += 2
+                num_fields = data[pos]
+                pos += 1
+
+                fields = []
+                for _ in range(num_fields):
+                    if pos + 3 > end:
+                        pos = end
+                        break
+                    fields.append((data[pos], data[pos + 1], little_endian))
+                    pos += 3
+
+                if header_byte & 0x20:
+                    if pos >= end:
+                        break
+                    num_dev_fields = data[pos]
+                    pos += 1
+                    pos += 3 * num_dev_fields
+
+                definitions[local_num] = {"global_msg_num": global_msg_num, "fields": fields}
+                continue
+
+            definition = definitions.get(local_num)
+            if definition is None:
+                break
+
+            fields = definition['fields']
+            if definition['global_msg_num'] != 0:
+                pos += sum(field_size for _, field_size, _ in fields)
+                continue
+
+            file_type = None
+            manufacturer = None
+            product = None
+            serial_number = None
+            time_created = None
+
+            for field_num, field_size, little_endian in fields:
+                if pos + field_size > end:
+                    pos = end
+                    break
+                if field_num == 0 and field_size == 1:
+                    file_type = data[pos]
+                elif field_num == 1 and field_size == 2:
+                    manufacturer = _read_u16(data, pos, little_endian)
+                elif field_num == 2 and field_size == 2:
+                    product = _read_u16(data, pos, little_endian)
+                elif field_num == 2 and field_size == 4:
+                    product = _read_u32(data, pos, little_endian)
+                elif field_num == 3 and field_size == 4:
+                    serial_number = _read_u32(data, pos, little_endian)
+                elif field_num == 4 and field_size == 4:
+                    time_created = _read_u32(data, pos, little_endian)
+                pos += field_size
+
+            if serial_number is None or time_created is None:
+                return None
+
+            parts = [
+                str(file_type if file_type is not None else ""),
+                str(manufacturer if manufacturer is not None else ""),
+                str(product if product is not None else ""),
+                str(serial_number),
+                str(time_created),
+            ]
+            return ":".join(parts)
+    except Exception:
+        pass
+    return None
+
+
+def _fit_start_date(data: bytes) -> str | None:
+    """Return the start date (YYYY-MM-DD) from a FIT file, or None."""
+    dt = _fit_start_datetime(data)
+    return dt.strftime('%Y-%m-%d') if dt is not None else None
 
 
 def _read_u16(data: bytes, pos: int, little_endian: bool) -> int:
@@ -113,6 +325,26 @@ def _safe_float(value: str | None) -> float | None:
         return float(text)
     except ValueError:
         return None
+
+
+def _parse_carelink_datetime(text: str | None) -> datetime | None:
+    if not text:
+        return None
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    for fmt in ('%Y/%m/%d %H:%M:%S', '%d/%m/%Y %H:%M:%S'):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def _parse_fit_records(data: bytes) -> dict:
@@ -347,6 +579,52 @@ def _parse_carelink_csv(csv_path: Path) -> dict:
     basal_points.sort(key=lambda x: x['timestamp'])
     bolus_events.sort(key=lambda x: x['timestamp'])
     return {'bg': bg_points, 'basal': basal_points, 'bolus': bolus_events}
+
+
+def _carelink_time_bounds(csv_path: Path) -> tuple[datetime | None, datetime | None]:
+    parsed = _parse_carelink_csv(csv_path)
+    timestamps: list[datetime] = []
+    for series_name in ('bg', 'basal', 'bolus'):
+        for point in parsed[series_name]:
+            point_dt = _parse_carelink_datetime(point.get('timestamp'))
+            if point_dt is not None:
+                timestamps.append(point_dt)
+
+    if timestamps:
+        return min(timestamps), max(timestamps)
+
+    try:
+        with csv_path.open('r', encoding='utf-8-sig', errors='ignore', newline='') as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            values = next(reader, None)
+        if not header or not values:
+            return None, None
+
+        indexes = {name: idx for idx, name in enumerate(header)}
+        start_text = values[indexes['Start Date']] if 'Start Date' in indexes and indexes['Start Date'] < len(values) else None
+        end_text = values[indexes['End Date']] if 'End Date' in indexes and indexes['End Date'] < len(values) else None
+        return _parse_carelink_datetime(start_text), _parse_carelink_datetime(end_text)
+    except Exception:
+        return None, None
+
+
+def _find_reusable_carelink_csv(activity_start_dt: datetime | None, activity_end_dt: datetime | None) -> tuple[Path, dict] | None:
+    if activity_start_dt is None or activity_end_dt is None:
+        return None
+
+    for walk_dir in _iter_walk_dirs():
+        meta = _load_walk_meta(walk_dir)
+        coverage_start = _parse_carelink_datetime(meta.get('carelink_start_time'))
+        coverage_end = _parse_carelink_datetime(meta.get('carelink_end_time'))
+        if coverage_start is None or coverage_end is None:
+            continue
+        if coverage_start <= activity_start_dt and activity_end_dt <= coverage_end:
+            csv_files = sorted(walk_dir.glob('*.csv'))
+            if csv_files:
+                return csv_files[0], meta
+
+    return None
 
 
 def _ts_to_dist_km(ts_secs: float, dist_pairs: list[tuple[float, float]]) -> float | None:
@@ -798,13 +1076,9 @@ async def parse_fit_date(file: UploadFile = File(...)):
 @app.get("/api/walks")
 def list_walks():
     walks = []
-    for folder in sorted(DATA_DIR.iterdir(), reverse=True):
-        if not folder.is_dir():
-            continue
-        meta_file = folder / "meta.json"
-        meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
-        files = sorted(f.name for f in folder.iterdir() if f.is_file() and f.name != "meta.json")
-        walks.append({"date": folder.name, "name": meta.get("name", ""), "files": files})
+    for walk_dir in _iter_walk_dirs():
+        walks.append(_load_walk_meta(walk_dir))
+    walks.sort(key=lambda walk: (walk.get("start_time") or "", walk["date"], walk["id"]), reverse=True)
     return walks
 
 
@@ -815,46 +1089,106 @@ async def upload_files(
     files: List[UploadFile] = File(...),
 ):
     date = _parse_date(date)
-    walk_dir = DATA_DIR / date
-    walk_dir.mkdir(exist_ok=True)
+    date_dir = DATA_DIR / date
+    date_dir.mkdir(exist_ok=True)
 
-    if name and name.strip():
-        (walk_dir / "meta.json").write_text(json.dumps({"name": name.strip()}))
+    prepared_files: list[tuple[str, bytes]] = []
+    fit_start_dt: datetime | None = None
+    fit_end_dt: datetime | None = None
+    fit_identity: str | None = None
+    has_uploaded_carelink_csv = False
+    for file in files:
+        if not file.filename:
+            continue
+        data = await file.read()
+        prepared_files.append((file.filename, data))
+        if fit_start_dt is None and file.filename.lower().endswith('.fit'):
+            fit_start_dt, fit_end_dt = _fit_time_bounds(data)
+        if fit_identity is None and file.filename.lower().endswith('.fit'):
+            fit_identity = _fit_file_identity(data)
+        if file.filename.lower().endswith('.csv'):
+            has_uploaded_carelink_csv = True
+
+    if fit_identity is not None:
+        for existing_walk_dir in _iter_walk_dirs():
+            existing_meta = _load_walk_meta(existing_walk_dir)
+            existing_fit_identity = existing_meta.get("fit_identity")
+            if existing_fit_identity is None:
+                existing_fit_files = sorted(existing_walk_dir.glob('*.fit'))
+                if existing_fit_files:
+                    existing_fit_identity = _fit_file_identity(existing_fit_files[0].read_bytes())
+            if existing_fit_identity == fit_identity:
+                existing_label = existing_meta.get("name") or existing_meta["date"]
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"That FIT activity is already loaded as {existing_label} ({existing_meta['id']})",
+                )
+
+    reused_carelink: tuple[Path, dict] | None = None
+    if not has_uploaded_carelink_csv:
+        reused_carelink = _find_reusable_carelink_csv(fit_start_dt, fit_end_dt)
+        if reused_carelink is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No Carelink CSV uploaded, and no existing loaded CSV covers this walk's activity window",
+            )
+
+    walk_name = (name or "").strip()
+    walk_id = _make_walk_id(date, fit_start_dt, walk_name, date_dir)
+    walk_dir = date_dir / walk_id
+    walk_dir.mkdir(exist_ok=False)
+
+    meta = {
+        "id": walk_id,
+        "date": date,
+        "name": walk_name,
+        "start_time": fit_start_dt.isoformat() if fit_start_dt is not None else None,
+        "fit_identity": fit_identity,
+    }
+    if reused_carelink is not None:
+        reused_csv_path, reused_meta = reused_carelink
+        meta["carelink_reused_from"] = reused_meta["id"]
+        meta["carelink_start_time"] = reused_meta.get("carelink_start_time")
+        meta["carelink_end_time"] = reused_meta.get("carelink_end_time")
+    (walk_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
     saved = []
-    for file in files:
-        dest = walk_dir / file.filename
-        with dest.open("wb") as f:
-            shutil.copyfileobj(file.file, f)
-        saved.append(file.filename)
+    reused = []
+    for filename, data in prepared_files:
+        dest = walk_dir / filename
+        dest.write_bytes(data)
+        saved.append(filename)
 
-    return {"date": date, "uploaded": saved}
+    if reused_carelink is not None:
+        reused_csv_path, _ = reused_carelink
+        dest = walk_dir / reused_csv_path.name
+        dest.write_bytes(reused_csv_path.read_bytes())
+        reused.append(reused_csv_path.name)
+
+    return {"id": walk_id, "date": date, "uploaded": saved, "reused": reused}
 
 
-@app.delete("/api/walks/{date}")
-def delete_walk(date: str):
-    date = _parse_date(date)
-    walk_dir = DATA_DIR / date
-    if not walk_dir.exists():
+@app.delete("/api/walks/{walk_id}")
+def delete_walk(walk_id: str):
+    walk_dir = _find_walk_dir(walk_id)
+    if walk_dir is None or not walk_dir.exists():
         raise HTTPException(status_code=404, detail="Walk not found")
     shutil.rmtree(walk_dir)
-    return {"deleted": date}
+    parent_dir = walk_dir.parent
+    if parent_dir != DATA_DIR and parent_dir.exists() and not any(parent_dir.iterdir()):
+        parent_dir.rmdir()
+    return {"deleted": walk_id}
 
 
-@app.get('/api/walks/{date}/analysis', response_class=HTMLResponse)
-def walk_analysis(date: str):
-    date = _parse_date(date)
-    walk_dir = DATA_DIR / date
-    if not walk_dir.exists() or not walk_dir.is_dir():
+@app.get('/api/walks/{walk_id}/analysis', response_class=HTMLResponse)
+def walk_analysis(walk_id: str):
+    walk_dir = _find_walk_dir(walk_id)
+    if walk_dir is None or not walk_dir.exists() or not walk_dir.is_dir():
         raise HTTPException(status_code=404, detail='Walk not found')
 
-    meta_file = walk_dir / 'meta.json'
-    walk_name = ''
-    if meta_file.exists():
-        try:
-            walk_name = json.loads(meta_file.read_text(encoding='utf-8')).get('name', '')
-        except Exception:
-            walk_name = ''
+    walk_meta = _load_walk_meta(walk_dir)
+    date = walk_meta['date']
+    walk_name = walk_meta['name']
 
     fit_files = sorted(walk_dir.glob('*.fit'))
     csv_files = sorted(walk_dir.glob('*.csv'))

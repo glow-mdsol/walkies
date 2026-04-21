@@ -41,14 +41,17 @@ export default function UploadForm({ onUploaded }) {
     form.append('date', date)
     form.append('name', name)
     form.append('files', fitFile)
-    form.append('files', carelinkFile)
+    if (carelinkFile) form.append('files', carelinkFile)
     if (gpxFile) form.append('files', gpxFile)
 
     try {
       const res = await fetch('/api/walks/upload', { method: 'POST', body: form })
       if (!res.ok) throw new Error((await res.json()).detail)
       const data = await res.json()
-      setMessage(`Uploaded ${data.uploaded.length} file(s) for ${data.date}`)
+      const uploadedCount = data.uploaded?.length ?? 0
+      const reusedCount = data.reused?.length ?? 0
+      const reusedText = reusedCount ? ` Reused ${reusedCount} Carelink file.` : ''
+      setMessage(`Uploaded ${uploadedCount} file(s) for ${data.date}.${reusedText}`)
       setName('')
       setDate(today())
       setDateSource(null)
@@ -106,8 +109,8 @@ export default function UploadForm({ onUploaded }) {
             type="file"
             accept=".csv"
             onChange={e => setCarelinkFile(e.target.files[0] ?? null)}
-            required
           />
+          <span className="hint">Optional if an existing loaded Carelink export already covers this walk</span>
         </div>
         <div className="field">
           <label htmlFor="walk-gpx">
