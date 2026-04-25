@@ -1,10 +1,11 @@
 import json
 import csv
-import html
 import math
 import re
 import shutil
 import struct
+import urllib.parse
+import urllib.request
 from datetime import date as date_type, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -12,7 +13,6 @@ import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
@@ -422,7 +422,7 @@ def _parse_fit_records(data: bytes) -> dict:
         if header_byte & 0x40:
             if pos + 5 > end:
                 break
-            pos += 1  # reserved
+            pos += 1
             little_endian = data[pos] == 0
             pos += 1
             global_msg_num = _read_u16(data, pos, little_endian)
@@ -578,6 +578,9 @@ def _parse_carelink_csv(csv_path: Path) -> dict:
     bg_points.sort(key=lambda x: x['timestamp'])
     basal_points.sort(key=lambda x: x['timestamp'])
     bolus_events.sort(key=lambda x: x['timestamp'])
+
+    # Keep unfiltered basal samples so we can carry the last known rate into chart start.
+    basal_points_all = list(basal_points)
     return {'bg': bg_points, 'basal': basal_points, 'bolus': bolus_events}
 
 
@@ -717,351 +720,630 @@ def _summary_metrics(activity_points: list[dict], bg_points: list[dict], bolus_e
     }
 
 
+def _bg_slope_per_hour(bg_values: list[tuple[datetime, float]]) -> float | None:
+    if len(bg_values) < 2:
+        return None
+    start_dt, start_bg = bg_values[0]
+    end_dt, end_bg = bg_values[-1]
+    duration_h = (end_dt - start_dt).total_seconds() / 3600.0
+    if duration_h <= 0:
+        return None
+    return (end_bg - start_bg) / duration_h
+
+
+def _phase_glucose_analytics(activity_points: list[dict], bg_points: list[dict]) -> dict:
+    if not activity_points:
+        return {'phases': [], 'during_slope_per_hour': None}
+
+    walk_start = datetime.fromisoformat(activity_points[0]['timestamp_iso'])
+    walk_end = datetime.fromisoformat(activity_points[-1]['timestamp_iso'])
+    phase_defs = [
+        ('pre', 'Pre (60m)', walk_start - timedelta(minutes=60), walk_start),
+        ('during', 'During Walk', walk_start, walk_end),
+        ('post', 'Post (120m)', walk_end, walk_end + timedelta(minutes=120)),
+    ]
+
+    all_bg: list[tuple[datetime, float]] = []
+    for point in bg_points:
+        try:
+            point_dt = datetime.fromisoformat(point['timestamp'])
+            point_bg = float(point['bg'])
+        except (KeyError, ValueError, TypeError):
+            continue
+        all_bg.append((point_dt, point_bg))
+
+    phases = []
+    for key, label, start_dt, end_dt in phase_defs:
+        phase_bg = [(ts, bg) for ts, bg in all_bg if start_dt <= ts <= end_dt]
+        slope = _bg_slope_per_hour(phase_bg)
+        delta = (phase_bg[-1][1] - phase_bg[0][1]) if len(phase_bg) >= 2 else None
+        phases.append({
+            'key': key,
+            'label': label,
+            'count': len(phase_bg),
+            'delta': delta,
+            'slope_per_hour': slope,
+        })
+
+    during = next((p for p in phases if p['key'] == 'during'), None)
+    return {
+        'phases': phases,
+        'during_slope_per_hour': during['slope_per_hour'] if during else None,
+    }
+
+
+def _interp_bg(ts_unix: float, bg_pairs: list[tuple[float, float]]) -> float | None:
+    if not bg_pairs:
+        return None
+    if ts_unix <= bg_pairs[0][0]:
+        return bg_pairs[0][1]
+    if ts_unix >= bg_pairs[-1][0]:
+        return bg_pairs[-1][1]
+
+    lo, hi = 0, len(bg_pairs) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if bg_pairs[mid][0] <= ts_unix:
+            lo = mid
+        else:
+            hi = mid
+    t0, b0 = bg_pairs[lo]
+    t1, b1 = bg_pairs[hi]
+    if t1 == t0:
+        return b0
+    frac = (ts_unix - t0) / (t1 - t0)
+    return b0 + frac * (b1 - b0)
+
+
+def _hr_zone_label(hr: float) -> str:
+    if hr < 110:
+        return '<110'
+    if hr < 130:
+        return '110-129'
+    if hr < 150:
+        return '130-149'
+    return '150+'
+
+
+def _intensity_glucose_analytics(activity_points: list[dict], bg_points: list[dict]) -> list[dict]:
+    zone_order = ['<110', '110-129', '130-149', '150+']
+    zone_stats = {
+        zone: {'minutes': 0.0, 'bg_values': [], 'points': []}
+        for zone in zone_order
+    }
+
+    bg_pairs: list[tuple[float, float]] = []
+    for point in bg_points:
+        try:
+            ts = datetime.fromisoformat(point['timestamp']).timestamp()
+            bg = float(point['bg'])
+        except (KeyError, ValueError, TypeError):
+            continue
+        bg_pairs.append((ts, bg))
+    bg_pairs.sort(key=lambda x: x[0])
+
+    walk_points: list[tuple[float, float]] = []
+    for point in activity_points:
+        if point.get('hr') is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(point['timestamp_iso']).timestamp()
+            hr = float(point['hr'])
+        except (KeyError, ValueError, TypeError):
+            continue
+        walk_points.append((ts, hr))
+    walk_points.sort(key=lambda x: x[0])
+
+    if not walk_points or not bg_pairs:
+        return []
+
+    for idx, (ts, hr) in enumerate(walk_points):
+        zone = _hr_zone_label(hr)
+        bg_val = _interp_bg(ts, bg_pairs)
+        if bg_val is not None:
+            zone_stats[zone]['bg_values'].append(bg_val)
+            zone_stats[zone]['points'].append((ts, bg_val))
+
+        if idx < len(walk_points) - 1:
+            dt_mins = max((walk_points[idx + 1][0] - ts) / 60.0, 0.0)
+            zone_stats[zone]['minutes'] += dt_mins
+
+    results = []
+    for zone in zone_order:
+        stat = zone_stats[zone]
+        vals = stat['bg_values']
+        bg_std = None
+        if len(vals) >= 2:
+            mean = sum(vals) / len(vals)
+            bg_std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+
+        zone_slope = _bg_slope_per_hour([
+            (datetime.fromtimestamp(ts, tz=timezone.utc), bg)
+            for ts, bg in stat['points']
+        ])
+
+        results.append({
+            'zone': zone,
+            'minutes': stat['minutes'],
+            'samples': len(vals),
+            'bg_std': bg_std,
+            'bg_slope_per_hour': zone_slope,
+        })
+    return results
+
+
+def _fetch_open_meteo_weather(
+    latitude: float,
+    longitude: float,
+    start_dt: datetime,
+    end_dt: datetime,
+) -> list[dict]:
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+    params = {
+        'latitude': f'{latitude:.6f}',
+        'longitude': f'{longitude:.6f}',
+        'start_date': start_dt.date().isoformat(),
+        'end_date': end_dt.date().isoformat(),
+        'hourly': 'temperature_2m,apparent_temperature,wind_speed_10m,wind_direction_10m',
+        'timezone': 'UTC',
+    }
+    url = f"https://archive-api.open-meteo.com/v1/archive?{urllib.parse.urlencode(params)}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=12) as response:
+            payload = json.loads(response.read().decode('utf-8'))
+    except Exception:
+        return []
+
+    hourly = payload.get('hourly') or {}
+    times = hourly.get('time') or []
+    temps = hourly.get('temperature_2m') or []
+    apparent = hourly.get('apparent_temperature') or []
+    wind = hourly.get('wind_speed_10m') or []
+    wind_dir = hourly.get('wind_direction_10m') or []
+
+    rows: list[dict] = []
+    for i, time_text in enumerate(times):
+        try:
+            ts = datetime.fromisoformat(time_text)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        if ts < start_dt or ts > end_dt:
+            continue
+
+        rows.append({
+            'timestamp': ts.isoformat(),
+            'temp_c': temps[i] if i < len(temps) else None,
+            'apparent_c': apparent[i] if i < len(apparent) else None,
+            'wind_kph': wind[i] if i < len(wind) else None,
+            'wind_dir_deg': wind_dir[i] if i < len(wind_dir) else None,
+        })
+    return rows
+
+
+def _weather_metrics(weather_points: list[dict]) -> dict:
+    if not weather_points:
+        return {'temp_avg_c': None, 'temp_min_c': None, 'temp_max_c': None, 'wind_avg_kph': None}
+
+    temps = [float(p['temp_c']) for p in weather_points if p.get('temp_c') is not None]
+    winds = [float(p['wind_kph']) for p in weather_points if p.get('wind_kph') is not None]
+    return {
+        'temp_avg_c': (sum(temps) / len(temps)) if temps else None,
+        'temp_min_c': min(temps) if temps else None,
+        'temp_max_c': max(temps) if temps else None,
+        'wind_avg_kph': (sum(winds) / len(winds)) if winds else None,
+    }
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2.0) ** 2
+    return 2.0 * r * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    lam1 = math.radians(lon1)
+    lam2 = math.radians(lon2)
+    y = math.sin(lam2 - lam1) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(lam2 - lam1)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _ang_diff_deg(a: float, b: float) -> float:
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def _weather_interp(ts: float, weather_pairs: list[tuple[float, dict]]) -> dict | None:
+    if not weather_pairs:
+        return None
+    if ts <= weather_pairs[0][0]:
+        return weather_pairs[0][1]
+    if ts >= weather_pairs[-1][0]:
+        return weather_pairs[-1][1]
+
+    lo, hi = 0, len(weather_pairs) - 1
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if weather_pairs[mid][0] <= ts:
+            lo = mid
+        else:
+            hi = mid
+
+    t0, w0 = weather_pairs[lo]
+    t1, w1 = weather_pairs[hi]
+    if t1 == t0:
+        return w0
+
+    frac = (ts - t0) / (t1 - t0)
+    out: dict = {}
+    for key in ('temp_c', 'apparent_c', 'wind_kph', 'wind_dir_deg'):
+        v0 = w0.get(key)
+        v1 = w1.get(key)
+        if v0 is None and v1 is None:
+            out[key] = None
+        elif v0 is None:
+            out[key] = v1
+        elif v1 is None:
+            out[key] = v0
+        elif key == 'wind_dir_deg':
+            delta = _ang_diff_deg(float(v1), float(v0))
+            out[key] = (float(v0) + frac * delta) % 360.0
+        else:
+            out[key] = float(v0) + frac * (float(v1) - float(v0))
+    return out
+
+
+def _weather_effort_analytics(activity_points: list[dict], weather_points: list[dict], duration_h: float | None) -> dict:
+    if len(activity_points) < 2 or not weather_points:
+        return {
+            'headwind_exposure_pct': None,
+            'headwind_avg_kph': None,
+            'tailwind_avg_kph': None,
+            'weather_stress_score': None,
+            'weather_stress_band': None,
+            'wind_rose': [],
+            'wind_profile': [],
+        }
+
+    weather_pairs: list[tuple[float, dict]] = []
+    for row in weather_points:
+        try:
+            ts = datetime.fromisoformat(row['timestamp']).timestamp()
+        except (KeyError, ValueError):
+            continue
+        weather_pairs.append((ts, row))
+    weather_pairs.sort(key=lambda x: x[0])
+    if not weather_pairs:
+        return {
+            'headwind_exposure_pct': None,
+            'headwind_avg_kph': None,
+            'tailwind_avg_kph': None,
+            'weather_stress_score': None,
+            'weather_stress_band': None,
+            'wind_rose': [],
+            'wind_profile': [],
+        }
+
+    rose_bins = [0.0] * 8
+    total_km = 0.0
+    headwind_km = 0.0
+    headwind_sum = 0.0
+    tailwind_sum = 0.0
+    wind_profile: list[dict] = []
+
+    for i in range(1, len(activity_points)):
+        a = activity_points[i - 1]
+        b = activity_points[i]
+        if a.get('lat') is None or a.get('lon') is None or b.get('lat') is None or b.get('lon') is None:
+            continue
+        if a.get('timestamp') is None or b.get('timestamp') is None:
+            continue
+
+        seg_km = None
+        if a.get('distance_m') is not None and b.get('distance_m') is not None:
+            d = float(b['distance_m']) - float(a['distance_m'])
+            if d > 0:
+                seg_km = d / 1000.0
+        if seg_km is None:
+            seg_km = _haversine_km(float(a['lat']), float(a['lon']), float(b['lat']), float(b['lon']))
+        if seg_km <= 0:
+            continue
+
+        mid_ts = (float(a['timestamp']) + float(b['timestamp'])) / 2.0
+        weather = _weather_interp(mid_ts, weather_pairs)
+        if not weather:
+            continue
+
+        wind_kph = weather.get('wind_kph')
+        wind_dir = weather.get('wind_dir_deg')
+        if wind_kph is None or wind_dir is None:
+            continue
+
+        heading = _bearing_deg(float(a['lat']), float(a['lon']), float(b['lat']), float(b['lon']))
+        alignment = math.cos(math.radians(_ang_diff_deg(heading, float(wind_dir))))
+        signed_component = float(wind_kph) * alignment
+        head_component = max(signed_component, 0.0)
+        tail_component = max(-signed_component, 0.0)
+
+        total_km += seg_km
+        headwind_sum += head_component * seg_km
+        tailwind_sum += tail_component * seg_km
+        if head_component >= 2.0:
+            headwind_km += seg_km
+
+        bin_index = int(((float(wind_dir) % 360.0) + 22.5) // 45.0) % 8
+        rose_bins[bin_index] += seg_km
+
+        wind_profile.append({
+            'distance_km': (float(b['distance_m']) / 1000.0) if b.get('distance_m') is not None else None,
+            'headwind_kph': head_component,
+            'tailwind_kph': tail_component,
+        })
+
+    if total_km <= 0:
+        return {
+            'headwind_exposure_pct': None,
+            'headwind_avg_kph': None,
+            'tailwind_avg_kph': None,
+            'weather_stress_score': None,
+            'weather_stress_band': None,
+            'wind_rose': [],
+            'wind_profile': wind_profile,
+        }
+
+    headwind_avg = headwind_sum / total_km
+    tailwind_avg = tailwind_sum / total_km
+    headwind_exposure_pct = (headwind_km / total_km) * 100.0
+
+    temps_apparent = [float(p['apparent_c']) for p in weather_points if p.get('apparent_c') is not None]
+    apparent_avg = (sum(temps_apparent) / len(temps_apparent)) if temps_apparent else None
+    apparent_max = max(temps_apparent) if temps_apparent else None
+    duration_term = min(duration_h or 0.0, 8.0) * 2.0
+    heat_term = (max((apparent_avg or 0.0) - 15.0, 0.0) * 2.0) + (max((apparent_max or 0.0) - 22.0, 0.0) * 1.5)
+    wind_term = headwind_avg * 1.2
+    stress_score = max(0.0, min(100.0, heat_term + wind_term + duration_term))
+    if stress_score < 25.0:
+        stress_band = 'Low'
+    elif stress_score < 50.0:
+        stress_band = 'Moderate'
+    elif stress_score < 75.0:
+        stress_band = 'High'
+    else:
+        stress_band = 'Very High'
+
+    compass = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+    wind_rose = [
+        {'dir': compass[i], 'distance_km': rose_bins[i], 'pct': (rose_bins[i] / total_km) * 100.0}
+        for i in range(8)
+    ]
+
+    return {
+        'headwind_exposure_pct': headwind_exposure_pct,
+        'headwind_avg_kph': headwind_avg,
+        'tailwind_avg_kph': tailwind_avg,
+        'weather_stress_score': stress_score,
+        'weather_stress_band': stress_band,
+        'wind_rose': wind_rose,
+        'wind_profile': wind_profile,
+    }
+
+
+def _stress_decoupling_analytics(activity_points: list[dict], weather_points: list[dict]) -> dict:
+    if len(activity_points) < 3:
+        return {
+            'series': [],
+            'episodes': [],
+            'summary': {
+                'score': None,
+                'band': None,
+                'elevated_minutes': None,
+                'elevated_pct': None,
+                'max_residual_bpm': None,
+            },
+            'defaults': {'smoothing_points': 5, 'threshold_bpm': 8.0},
+        }
+
+    weather_pairs: list[tuple[float, dict]] = []
+    for row in weather_points:
+        try:
+            ts = datetime.fromisoformat(row['timestamp']).timestamp()
+        except (KeyError, ValueError):
+            continue
+        weather_pairs.append((ts, row))
+    weather_pairs.sort(key=lambda x: x[0])
+
+    samples: list[dict] = []
+    for i in range(1, len(activity_points)):
+        prev = activity_points[i - 1]
+        curr = activity_points[i]
+
+        if prev.get('timestamp') is None or curr.get('timestamp') is None:
+            continue
+        if prev.get('hr') is None or curr.get('hr') is None:
+            continue
+
+        dt_s = float(curr['timestamp']) - float(prev['timestamp'])
+        if dt_s <= 0 or dt_s > 120:
+            continue
+
+        dist_m = None
+        if prev.get('distance_m') is not None and curr.get('distance_m') is not None:
+            delta_m = float(curr['distance_m']) - float(prev['distance_m'])
+            if delta_m > 0:
+                dist_m = delta_m
+        if dist_m is None and prev.get('lat') is not None and prev.get('lon') is not None and curr.get('lat') is not None and curr.get('lon') is not None:
+            dist_m = _haversine_km(float(prev['lat']), float(prev['lon']), float(curr['lat']), float(curr['lon'])) * 1000.0
+        if dist_m is None or dist_m <= 0:
+            continue
+
+        speed_kph = (dist_m / dt_s) * 3.6
+        if speed_kph <= 0:
+            continue
+
+        grade_pct = 0.0
+        if prev.get('altitude_m') is not None and curr.get('altitude_m') is not None and dist_m >= 20.0:
+            grade_pct = ((float(curr['altitude_m']) - float(prev['altitude_m'])) / dist_m) * 100.0
+            grade_pct = max(-12.0, min(12.0, grade_pct))
+
+        mid_ts = (float(prev['timestamp']) + float(curr['timestamp'])) / 2.0
+        wx = _weather_interp(mid_ts, weather_pairs) if weather_pairs else None
+        apparent_c = None
+        if wx is not None and wx.get('apparent_c') is not None:
+            apparent_c = float(wx['apparent_c'])
+
+        heat_load = max((apparent_c or 18.0) - 18.0, 0.0)
+        uphill_load = max(grade_pct, 0.0)
+        effort_index = speed_kph + (0.7 * uphill_load) + (0.25 * heat_load)
+
+        hr = float(curr['hr'])
+        distance_km = (float(curr['distance_m']) / 1000.0) if curr.get('distance_m') is not None else None
+        samples.append({
+            'timestamp': curr['timestamp_iso'],
+            'distance_km': distance_km,
+            'hr': hr,
+            'effort_index': effort_index,
+            'dt_s': dt_s,
+        })
+
+    if len(samples) < 8:
+        return {
+            'series': [],
+            'episodes': [],
+            'summary': {
+                'score': None,
+                'band': None,
+                'elevated_minutes': None,
+                'elevated_pct': None,
+                'max_residual_bpm': None,
+            },
+            'defaults': {'smoothing_points': 5, 'threshold_bpm': 8.0},
+        }
+
+    mean_effort = sum(s['effort_index'] for s in samples) / len(samples)
+    mean_hr = sum(s['hr'] for s in samples) / len(samples)
+    var_effort = sum((s['effort_index'] - mean_effort) ** 2 for s in samples)
+    cov = sum((s['effort_index'] - mean_effort) * (s['hr'] - mean_hr) for s in samples)
+
+    slope = (cov / var_effort) if var_effort > 1e-6 else 0.0
+    intercept = mean_hr - slope * mean_effort
+
+    for idx, sample in enumerate(samples):
+        expected_hr = intercept + slope * sample['effort_index']
+        residual = sample['hr'] - expected_hr
+        start = max(0, idx - 2)
+        end = min(len(samples), idx + 3)
+        smooth = sum(samples[j].get('residual_raw', residual) for j in range(start, end)) / (end - start)
+        sample['expected_hr'] = expected_hr
+        sample['residual_raw'] = residual
+        sample['residual_bpm'] = smooth
+
+    elevated_secs = 0.0
+    max_residual = max(sample['residual_bpm'] for sample in samples)
+    episode_start = None
+    episodes: list[dict] = []
+
+    for sample in samples:
+        elevated = sample['residual_bpm'] >= 8.0
+        sample['flag_elevated'] = elevated
+        if elevated:
+            elevated_secs += sample['dt_s']
+            if episode_start is None:
+                episode_start = sample
+        elif episode_start is not None:
+            episodes.append({'start': episode_start['timestamp'], 'end': sample['timestamp']})
+            episode_start = None
+
+    if episode_start is not None:
+        episodes.append({'start': episode_start['timestamp'], 'end': samples[-1]['timestamp']})
+
+    total_secs = sum(s['dt_s'] for s in samples)
+    elevated_pct = (elevated_secs / total_secs) * 100.0 if total_secs > 0 else 0.0
+    elevated_minutes = elevated_secs / 60.0
+
+    score = min(100.0, max(0.0, elevated_pct * 1.2 + max(max_residual - 6.0, 0.0) * 4.0))
+    if score < 20.0:
+        band = 'Low'
+    elif score < 45.0:
+        band = 'Moderate'
+    elif score < 70.0:
+        band = 'High'
+    else:
+        band = 'Very High'
+
+    return {
+        'series': [
+            {
+                'timestamp': s['timestamp'],
+                'distance_km': s['distance_km'],
+                'hr': s['hr'],
+                'expected_hr': s['expected_hr'],
+                'residual_raw': s['residual_raw'],
+                'residual_bpm': s['residual_bpm'],
+                'flag_elevated': s['flag_elevated'],
+            }
+            for s in samples if s['distance_km'] is not None
+        ],
+        'episodes': episodes,
+        'summary': {
+            'score': score,
+            'band': band,
+            'elevated_minutes': elevated_minutes,
+            'elevated_pct': elevated_pct,
+            'max_residual_bpm': max_residual,
+        },
+        'defaults': {'smoothing_points': 5, 'threshold_bpm': 8.0},
+    }
+
+
+def _stress_summary_for_walk_dir(walk_dir: Path) -> dict | None:
+    fit_files = sorted(walk_dir.glob('*.fit'))
+    if not fit_files:
+        return None
+
+    activity_points: list[dict] = []
+    for fit_path in fit_files:
+        parsed = _parse_fit_records(fit_path.read_bytes())
+        activity_points.extend(parsed['points'])
+    activity_points.sort(key=lambda p: p['timestamp'])
+    if not activity_points:
+        return None
+
+    stress = _stress_decoupling_analytics(activity_points, [])
+    summary = stress.get('summary') or {}
+    if summary.get('score') is None:
+        return None
+
+    meta = _load_walk_meta(walk_dir)
+    metrics = _summary_metrics(activity_points, [], [])
+    return {
+        'walk_id': meta.get('id'),
+        'date': meta.get('date'),
+        'name': meta.get('name') or meta.get('date') or meta.get('id'),
+        'start_time': meta.get('start_time') or activity_points[0].get('timestamp_iso'),
+        'score': summary.get('score'),
+        'band': summary.get('band'),
+        'elevated_minutes': summary.get('elevated_minutes'),
+        'distance_km': metrics.get('distance_km'),
+    }
+
+
 def _fmt(value: float | None, digits: int = 2, suffix: str = '') -> str:
     if value is None or (isinstance(value, float) and (math.isnan(value) or math.isinf(value))):
         return 'n/a'
     return f'{value:.{digits}f}{suffix}'
-
-
-def _build_analysis_html(date: str, walk_name: str, payload: dict, metrics: dict) -> str:
-    title = walk_name or f'Walk {date}'
-    json_payload = json.dumps(payload)
-    safe_title = html.escape(title)
-
-    return f"""<!doctype html>
-<html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>Walkies Analysis - {safe_title}</title>
-  <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\" />
-  <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin />
-  <link href=\"https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Fraunces:opsz,wght@9..144,700&display=swap\" rel=\"stylesheet\" />
-  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" integrity=\"sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=\" crossorigin=\"\" />
-  <style>
-    :root {{
-      --ink: #102539;
-      --bg: #f7fbff;
-      --panel: #ffffff;
-      --accent: #0a8f8f;
-      --accent-soft: #dcf4f4;
-      --grid: #d8e4ef;
-      --warn: #c64200;
-      --ok: #2f7c4f;
-      --shadow: 0 10px 28px rgba(16, 37, 57, 0.12);
-      --radius: 14px;
-    }}
-
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      color: var(--ink);
-      font-family: 'Manrope', sans-serif;
-      background: radial-gradient(circle at top right, #e4f7f7 0%, var(--bg) 45%), var(--bg);
-      padding: 18px;
-    }}
-
-    .container {{ max-width: 1200px; margin: 0 auto; display: grid; gap: 14px; }}
-    .hero {{
-      background: linear-gradient(135deg, #12344a, #0a8f8f);
-      color: #fff;
-      padding: 18px 22px;
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      animation: fade-in 500ms ease;
-    }}
-
-    .hero h1 {{
-      margin: 0;
-      font-family: 'Fraunces', serif;
-      font-size: clamp(1.35rem, 2.2vw, 2rem);
-      letter-spacing: 0.01em;
-    }}
-
-    .hero p {{ margin: 6px 0 0; opacity: 0.9; }}
-
-    .stats {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 10px;
-      animation: fade-in 700ms ease;
-    }}
-
-    .stat {{
-      background: var(--panel);
-      border: 1px solid #e4edf6;
-      border-radius: 12px;
-      padding: 10px 12px;
-      box-shadow: 0 6px 18px rgba(16, 37, 57, 0.08);
-    }}
-
-    .label {{ font-size: 0.78rem; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.05em; }}
-    .value {{ margin-top: 4px; font-size: 1.2rem; font-weight: 800; }}
-
-    .panel {{
-      background: var(--panel);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-      animation: fade-in 900ms ease;
-    }}
-
-    .panel-head {{
-      padding: 10px 14px;
-      border-bottom: 1px solid #ebf1f7;
-      font-weight: 700;
-      background: linear-gradient(90deg, #f8fdff, #f2fbfb);
-    }}
-
-    #timeline {{ min-height: 520px; }}
-    #map {{ height: 440px; }}
-
-    @keyframes fade-in {{
-      from {{ opacity: 0; transform: translateY(8px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-
-    @media (max-width: 768px) {{
-      body {{ padding: 10px; }}
-      #timeline {{ min-height: 440px; }}
-      #map {{ height: 360px; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class=\"container\">
-    <section class=\"hero\">
-      <h1>{safe_title}</h1>
-      <p>{html.escape(date)} | Distance, HR, BG, insulin delivery, altitude, and route context</p>
-    </section>
-
-    <section class=\"stats\">
-      <article class=\"stat\"><div class=\"label\">Distance</div><div class=\"value\">{_fmt(metrics['distance_km'], 2, ' km')}</div></article>
-      <article class=\"stat\"><div class=\"label\">Duration</div><div class=\"value\">{_fmt(metrics['duration_h'], 2, ' h')}</div></article>
-      <article class=\"stat\"><div class=\"label\">Avg HR</div><div class=\"value\">{_fmt(metrics['avg_hr'], 0, ' bpm')}</div></article>
-      <article class=\"stat\"><div class=\"label\">BG Delta (Walk)</div><div class=\"value\">{_fmt(metrics['bg_delta'], 2, ' mmol/L')}</div></article>
-      <article class=\"stat\"><div class=\"label\">Time In Range</div><div class=\"value\">{_fmt(metrics['tir_pct'], 0, '%')}</div></article>
-      <article class=\"stat\"><div class=\"label\">Hypos During Walk</div><div class=\"value\">{metrics['hypos']}</div></article>
-      <article class=\"stat\"><div class=\"label\">Bolus During Walk</div><div class=\"value\">{_fmt(metrics['bolus_units'], 2, ' U')}</div></article>
-    </section>
-
-    <section class=\"panel\">
-      <div class=\"panel-head\">Timeline</div>
-      <div id=\"timeline\"></div>
-    </section>
-
-    <section class=\"panel\">
-      <div class=\"panel-head\">Map</div>
-      <div id=\"map\"></div>
-    </section>
-  </div>
-
-  <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>
-  <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\" integrity=\"sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=\" crossorigin=\"\"></script>
-  <script>
-    const payload = {json_payload};
-
-        const toSeries = (items, yKey) => ({{
-      x: items.map(p => p.distance_km),
-      y: items.map(p => p[yKey]),
-        }});
-
-    const hrSeries = toSeries(payload.activity, 'hr');
-    const altitudeSeries = toSeries(payload.activity, 'altitude_m');
-    const bgSeries = toSeries(payload.bg, 'bg');
-    const basalSeries = toSeries(payload.basal, 'rate');
-    const bolusSeries = toSeries(payload.bolus, 'units');
-
-    const traces = [
-            // Altitude baseline (invisible) for fill reference — avoids tozeroy forcing y-axis to include 0
-            {{
-                x: altitudeSeries.x,
-                y: (() => {{ const vals = altitudeSeries.y.filter(v => v != null); const base = vals.length ? Math.min(...vals) : 0; return altitudeSeries.x.map(() => base); }})(),
-                name: 'alt_base',
-                mode: 'lines',
-                line: {{ width: 0, color: 'transparent' }},
-                showlegend: false,
-                hoverinfo: 'skip',
-                yaxis: 'y',
-            }},
-            {{
-                x: altitudeSeries.x,
-                y: altitudeSeries.y,
-                name: 'Altitude (m)',
-                mode: 'lines',
-                fill: 'tonexty',
-                fillcolor: 'rgba(90,111,133,0.15)',
-                line: {{ width: 1.6, color: '#5a6f85' }},
-                                hovertemplate: 'Altitude: %{{y:.1f}} m<extra></extra>',
-                yaxis: 'y',
-            }},
-            {{
-                x: hrSeries.x,
-                y: hrSeries.y,
-                name: 'HR (bpm)',
-                mode: 'lines',
-                line: {{ width: 2, color: '#ef5b0c' }},
-                                hovertemplate: 'HR: %{{y:.0f}} bpm<extra></extra>',
-                yaxis: 'y2',
-            }},
-      {{
-        x: bgSeries.x,
-        y: bgSeries.y,
-        name: 'BG (mmol/L)',
-        mode: 'lines+markers',
-        marker: {{ size: 5, color: '#7d00b8' }},
-        line: {{ width: 2, color: '#7d00b8' }},
-                hovertemplate: 'BG: %{{y:.1f}} mmol/L<extra></extra>',
-        yaxis: 'y3',
-      }},
-      {{
-        x: basalSeries.x,
-        y: basalSeries.y,
-        name: 'Basal (U/h)',
-        mode: 'lines',
-        line: {{ width: 1.6, color: '#00745a' }},
-                hovertemplate: 'Basal: %{{y:.2f}} U/h<extra></extra>',
-        yaxis: 'y4',
-      }},
-      {{
-        x: bolusSeries.x,
-        y: bolusSeries.y,
-        name: 'Bolus (U)',
-        type: 'bar',
-        marker: {{ color: '#0057b8' }},
-                hovertemplate: 'Bolus: %{{y:.2f}} U<extra></extra>',
-        yaxis: 'y4',
-        opacity: 0.55,
-      }},
-    ];
-
-    const layout = {{
-      margin: {{ l: 58, r: 68, t: 24, b: 42 }},
-      paper_bgcolor: '#ffffff',
-      plot_bgcolor: '#ffffff',
-        hovermode: 'x',
-        hoverlabel: {{ bgcolor: '#ffffff', bordercolor: '#c9d6e3', font: {{ color: '#102539' }} }},
-      legend: {{ orientation: 'h', y: 1.14, x: 0 }},
-            xaxis: {{ showgrid: true, gridcolor: '#edf3f9', title: 'Distance (km)', side: 'bottom', anchor: 'y3', automargin: true, showspikes: true, spikemode: 'across', spikesnap: 'cursor', spikecolor: 'rgba(44,62,80,0.45)', spikethickness: 1.2, range: payload.chartDistanceStart != null && payload.chartDistanceEnd != null ? [payload.chartDistanceStart, payload.chartDistanceEnd] : undefined }},
-      annotations: (payload.timeMarkers || []).map(m => ({{
-        xref: 'x', yref: 'paper', x: m.distance_km, y: 1.03,
-        text: m.label, showarrow: false,
-        font: {{ size: 9, color: '#667788' }}, xanchor: 'center',
-            }})).concat(
-                payload.walkDistanceStart != null && payload.walkDistanceEnd != null
-                    ? [
-                            {{
-                                xref: 'x', yref: 'paper', x: payload.walkDistanceStart, y: -0.12,
-                                text: 'Walk start', showarrow: false,
-                                font: {{ size: 10, color: '#5b6c7d' }}, xanchor: 'left',
-                            }},
-                            {{
-                                xref: 'x', yref: 'paper', x: payload.walkDistanceEnd, y: -0.12,
-                                text: 'Walk end', showarrow: false,
-                                font: {{ size: 10, color: '#5b6c7d' }}, xanchor: 'right',
-                            }},
-                        ]
-                    : []
-            ),
-
-    yaxis: {{ domain: [0.70, 1.0], title: 'Altitude (m)', showgrid: true, gridcolor: '#edf3f9' }},
-    yaxis2: {{ domain: [0.38, 0.64], title: 'HR (bpm)', showgrid: true, gridcolor: '#edf3f9' }},
-      yaxis3: {{ domain: [0.0, 0.30], title: 'BG (mmol/L)', showgrid: true, gridcolor: '#edf3f9' }},
-      yaxis4: {{ overlaying: 'y3', side: 'right', title: 'Insulin', showgrid: false }},
-      shapes: [
-                ...(payload.walkDistanceStart != null && payload.walkDistanceEnd != null ? [{{
-                    type: 'rect', xref: 'x', yref: 'paper',
-                    x0: payload.walkDistanceStart, x1: payload.walkDistanceEnd, y0: 0, y1: 1,
-                    fillcolor: 'rgba(16, 37, 57, 0.03)', line: {{ width: 0 }}, layer: 'below',
-                }}, {{
-                    type: 'line', xref: 'x', yref: 'paper',
-                    x0: payload.walkDistanceStart, x1: payload.walkDistanceStart, y0: 0, y1: 1,
-                    line: {{ color: 'rgba(16, 37, 57, 0.25)', width: 1.5, dash: 'solid' }},
-                }}, {{
-                    type: 'line', xref: 'x', yref: 'paper',
-                    x0: payload.walkDistanceEnd, x1: payload.walkDistanceEnd, y0: 0, y1: 1,
-                    line: {{ color: 'rgba(16, 37, 57, 0.25)', width: 1.5, dash: 'solid' }},
-                }}] : []),
-        {{ type: 'rect', xref: 'paper', yref: 'y3', x0: 0, x1: 1, y0: 4.0, y1: 8.0, fillcolor: 'rgba(47, 124, 79, 0.12)', line: {{ width: 0 }} }},
-        ...(payload.timeMarkers || []).map(m => ({{
-          type: 'line', xref: 'x', yref: 'paper',
-          x0: m.distance_km, x1: m.distance_km, y0: 0, y1: 1,
-          line: {{ color: 'rgba(100,110,130,0.3)', width: 1, dash: m.label.endsWith('00') ? 'solid' : 'dot' }},
-        }})),
-      ],
-    }};
-
-    Plotly.newPlot('timeline', traces, layout, {{ responsive: true, displaylogo: false }});
-
-    const map = L.map('map');
-    const mapTrack = payload.mapTrack;
-    const hasTrack = Array.isArray(mapTrack) && mapTrack.length > 1;
-
-    L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-      attribution: '&copy; OpenStreetMap contributors',
-      maxZoom: 18,
-    }}).addTo(map);
-
-    if (hasTrack) {{
-      const bounds = [];
-      const colorForHr = (hr) => {{
-        if (hr == null) return '#1e5f99';
-        if (hr < 110) return '#1f8a70';
-        if (hr < 130) return '#94b447';
-        if (hr < 150) return '#e6a700';
-        return '#d64545';
-      }};
-
-      for (let i = 1; i < mapTrack.length; i++) {{
-        const a = mapTrack[i - 1];
-        const b = mapTrack[i];
-        const segment = [[a[0], a[1]], [b[0], b[1]]];
-        const hr = a.length > 2 ? a[2] : null;
-        L.polyline(segment, {{ color: colorForHr(hr), weight: 5, opacity: 0.85 }}).addTo(map);
-        bounds.push(segment[0], segment[1]);
-      }}
-
-      L.circleMarker(mapTrack[0], {{ radius: 6, color: '#114b5f', fillColor: '#fff', fillOpacity: 1, weight: 2 }}).addTo(map).bindTooltip('Start');
-      L.circleMarker(mapTrack[mapTrack.length - 1], {{ radius: 6, color: '#8a1c7c', fillColor: '#fff', fillOpacity: 1, weight: 2 }}).addTo(map).bindTooltip('Finish');
-
-            (payload.mapHourMarkers || []).forEach(marker => {{
-                L.circleMarker([marker.lat, marker.lon], {{
-                    radius: 5,
-                    color: '#3c4f65',
-                    fillColor: '#ffffff',
-                    fillOpacity: 1,
-                    weight: 2,
-                }}).addTo(map).bindTooltip(marker.label, {{ direction: 'top', offset: [0, -4] }});
-            }});
-
-      map.fitBounds(bounds, {{ padding: [24, 24] }});
-
-      const legend = L.control({{ position: 'bottomright' }});
-      legend.onAdd = () => {{
-        const div = L.DomUtil.create('div');
-        div.style.cssText = 'background:#fff;padding:8px 10px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.18);font:12px Manrope,sans-serif;line-height:1.7;min-width:120px';
-        div.innerHTML = `
-          <div style="font-weight:700;margin-bottom:4px">Heart Rate</div>
-          <div><span style="display:inline-block;width:14px;height:4px;background:#1f8a70;border-radius:2px;vertical-align:middle;margin-right:6px"></span>&lt; 110 bpm</div>
-          <div><span style="display:inline-block;width:14px;height:4px;background:#94b447;border-radius:2px;vertical-align:middle;margin-right:6px"></span>110–129 bpm</div>
-          <div><span style="display:inline-block;width:14px;height:4px;background:#e6a700;border-radius:2px;vertical-align:middle;margin-right:6px"></span>130–149 bpm</div>
-          <div><span style="display:inline-block;width:14px;height:4px;background:#d64545;border-radius:2px;vertical-align:middle;margin-right:6px"></span>≥ 150 bpm</div>
-          <div><span style="display:inline-block;width:14px;height:4px;background:#1e5f99;border-radius:2px;vertical-align:middle;margin-right:6px"></span>No HR data</div>
-          <div style="margin-top:6px;font-weight:700">Markers</div>
-          <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid #114b5f;background:#fff;vertical-align:middle;margin-right:6px"></span>Start</div>
-          <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid #8a1c7c;background:#fff;vertical-align:middle;margin-right:6px"></span>Finish</div>
-                    <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;border:2px solid #3c4f65;background:#fff;vertical-align:middle;margin-right:6px"></span>Hourly marker</div>
-        `;
-        return div;
-      }};
-      legend.addTo(map);
-    }} else {{
-      map.setView([54.43, -2.96], 11);
-    }}
-  </script>
-</body>
-</html>
-"""
 
 
 @app.post("/api/walks/parse-fit-date")
@@ -1180,8 +1462,7 @@ def delete_walk(walk_id: str):
     return {"deleted": walk_id}
 
 
-@app.get('/api/walks/{walk_id}/analysis', response_class=HTMLResponse)
-def walk_analysis(walk_id: str):
+def _get_walk_analysis_data(walk_id: str) -> tuple[str, str | None, dict, dict]:
     walk_dir = _find_walk_dir(walk_id)
     if walk_dir is None or not walk_dir.exists() or not walk_dir.is_dir():
         raise HTTPException(status_code=404, detail='Walk not found')
@@ -1253,6 +1534,9 @@ def walk_analysis(walk_id: str):
     basal_points.sort(key=lambda x: x['timestamp'])
     bolus_events.sort(key=lambda x: x['timestamp'])
 
+    # Keep unfiltered basal samples so we can carry the last known rate into chart start.
+    basal_points_all = list(basal_points)
+
     bg_points = _window_filter(bg_points, start_dt, end_dt, 'timestamp')
     basal_points = _window_filter(basal_points, start_dt, end_dt, 'timestamp')
     bolus_events = _window_filter(bolus_events, start_dt, end_dt, 'timestamp')
@@ -1277,8 +1561,79 @@ def walk_analysis(walk_id: str):
             )
         else:
             pt['distance_km'] = _ts_to_dist_km(point_ts, dist_pairs)
-    for pt in basal_points:
-        pt['distance_km'] = _ts_to_dist_km(datetime.fromisoformat(pt['timestamp']).timestamp(), dist_pairs)
+    def _ts_to_chart_dist(ts_secs: float) -> float | None:
+        if walk_start_unix is not None and ts_secs < walk_start_unix:
+            return max(
+                -bg_buffer_km,
+                ((ts_secs - walk_start_unix) / bg_buffer_secs) * bg_buffer_km,
+            )
+        if walk_end_unix is not None and walk_distance_end is not None and ts_secs > walk_end_unix:
+            return min(
+                walk_distance_end + bg_buffer_km,
+                walk_distance_end + ((ts_secs - walk_end_unix) / bg_buffer_secs) * bg_buffer_km,
+            )
+        return _ts_to_dist_km(ts_secs, dist_pairs)
+
+    if dist_pairs and walk_start_unix is not None and walk_end_unix is not None and basal_points_all:
+        chart_start_unix = walk_start_unix - bg_buffer_secs
+        chart_end_unix = walk_end_unix + bg_buffer_secs
+
+        basal_rows: list[tuple[float, float]] = []
+        for point in basal_points_all:
+            try:
+                ts_secs = datetime.fromisoformat(point['timestamp']).timestamp()
+                rate = float(point['rate'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            basal_rows.append((ts_secs, rate))
+        basal_rows.sort(key=lambda row: row[0])
+
+        carry_rate = None
+        for ts_secs, rate in basal_rows:
+            if ts_secs <= chart_start_unix:
+                carry_rate = rate
+            else:
+                break
+
+        chart_basal: list[dict] = []
+        if carry_rate is not None:
+            chart_basal.append({
+                'timestamp': datetime.fromtimestamp(chart_start_unix, tz=timezone.utc).isoformat(),
+                'rate': carry_rate,
+                'distance_km': chart_distance_start,
+            })
+
+        for ts_secs, rate in basal_rows:
+            if ts_secs < chart_start_unix or ts_secs > chart_end_unix:
+                continue
+            dist = _ts_to_chart_dist(ts_secs)
+            if dist is None:
+                continue
+            chart_basal.append({
+                'timestamp': datetime.fromtimestamp(ts_secs, tz=timezone.utc).isoformat(),
+                'rate': rate,
+                'distance_km': dist,
+            })
+
+        if chart_basal:
+            compressed: list[dict] = [chart_basal[0]]
+            for point in chart_basal[1:]:
+                prev = compressed[-1]
+                if abs(float(point['rate']) - float(prev['rate'])) > 1e-9:
+                    compressed.append(point)
+            last_rate = compressed[-1]['rate']
+            compressed.append({
+                'timestamp': datetime.fromtimestamp(chart_end_unix, tz=timezone.utc).isoformat(),
+                'rate': last_rate,
+                'distance_km': chart_distance_end,
+            })
+            basal_points = compressed
+        else:
+            basal_points = []
+    else:
+        for pt in basal_points:
+            pt['distance_km'] = _ts_to_dist_km(datetime.fromisoformat(pt['timestamp']).timestamp(), dist_pairs)
+
     for pt in bolus_events:
         pt['distance_km'] = _ts_to_dist_km(datetime.fromisoformat(pt['timestamp']).timestamp(), dist_pairs)
 
@@ -1325,11 +1680,78 @@ def walk_analysis(walk_id: str):
     else:
         map_track = []
 
+    weather_points: list[dict] = []
+    if activity_points and dist_pairs:
+        if map_track:
+            weather_lat = map_track[0][0]
+            weather_lon = map_track[0][1]
+        else:
+            coord_points = [p for p in activity_points if p.get('lat') is not None and p.get('lon') is not None]
+            weather_lat = coord_points[0]['lat'] if coord_points else None
+            weather_lon = coord_points[0]['lon'] if coord_points else None
+
+        if weather_lat is not None and weather_lon is not None:
+            activity_start_dt = datetime.fromisoformat(activity_points[0]['timestamp_iso'])
+            activity_end_dt = datetime.fromisoformat(activity_points[-1]['timestamp_iso'])
+            weather_rows = _fetch_open_meteo_weather(weather_lat, weather_lon, activity_start_dt, activity_end_dt)
+            for row in weather_rows:
+                try:
+                    ts = datetime.fromisoformat(row['timestamp'])
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except (KeyError, ValueError):
+                    continue
+                distance_km = _ts_to_dist_km(ts.timestamp(), dist_pairs)
+                if distance_km is None:
+                    continue
+                weather_points.append({
+                    'timestamp': row['timestamp'],
+                    'distance_km': distance_km,
+                    'temp_c': row.get('temp_c'),
+                    'apparent_c': row.get('apparent_c'),
+                    'wind_kph': row.get('wind_kph'),
+                    'wind_dir_deg': row.get('wind_dir_deg'),
+                })
+
+    metrics = _summary_metrics(activity_points, bg_points, bolus_events)
+    weather_effort = _weather_effort_analytics(activity_points, weather_points, metrics.get('duration_h'))
+    stress_analytics = _stress_decoupling_analytics(activity_points, weather_points)
+
+    trend_rows: list[dict] = []
+    current_summary = stress_analytics.get('summary') or {}
+    if current_summary.get('score') is not None:
+        trend_rows.append({
+            'walk_id': walk_meta.get('id'),
+            'date': walk_meta.get('date'),
+            'name': walk_name or walk_meta.get('date') or walk_meta.get('id'),
+            'start_time': walk_meta.get('start_time') or (activity_points[0]['timestamp_iso'] if activity_points else None),
+            'score': current_summary.get('score'),
+            'band': current_summary.get('band'),
+            'elevated_minutes': current_summary.get('elevated_minutes'),
+            'distance_km': metrics.get('distance_km'),
+        })
+
+    for other_walk_dir in _iter_walk_dirs():
+        if other_walk_dir == walk_dir:
+            continue
+        other_summary = _stress_summary_for_walk_dir(other_walk_dir)
+        if other_summary is not None:
+            trend_rows.append(other_summary)
+
+    trend_rows.sort(key=lambda r: (r.get('start_time') or '', r.get('date') or '', r.get('walk_id') or ''))
+
     payload = {
         'activity': activity_series,
         'bg': bg_points,
         'basal': basal_points,
         'bolus': bolus_events,
+        'phaseAnalytics': _phase_glucose_analytics(activity_points, bg_points),
+        'intensityAnalytics': _intensity_glucose_analytics(activity_points, bg_points),
+        'weather': weather_points,
+        'windProfile': weather_effort['wind_profile'],
+        'windRose': weather_effort['wind_rose'],
+        'stressAnalytics': stress_analytics,
+        'stressTrend': trend_rows,
         'mapTrack': map_track,
         'mapHourMarkers': map_hour_markers,
         'timeMarkers': time_markers,
@@ -1338,5 +1760,45 @@ def walk_analysis(walk_id: str):
         'chartDistanceStart': chart_distance_start,
         'chartDistanceEnd': chart_distance_end,
     }
-    metrics = _summary_metrics(activity_points, bg_points, bolus_events)
-    return _build_analysis_html(date, walk_name, payload, metrics)
+    metrics['bg_slope_during_h'] = payload['phaseAnalytics'].get('during_slope_per_hour')
+    metrics.update(_weather_metrics(weather_points))
+    metrics.update({
+        'headwind_exposure_pct': weather_effort.get('headwind_exposure_pct'),
+        'headwind_avg_kph': weather_effort.get('headwind_avg_kph'),
+        'tailwind_avg_kph': weather_effort.get('tailwind_avg_kph'),
+        'weather_stress_score': weather_effort.get('weather_stress_score'),
+        'weather_stress_band': weather_effort.get('weather_stress_band'),
+        'hr_decoupling_score': stress_analytics['summary'].get('score'),
+        'hr_decoupling_band': stress_analytics['summary'].get('band'),
+        'hr_elevated_minutes': stress_analytics['summary'].get('elevated_minutes'),
+    })
+
+    return date, walk_name, payload, metrics
+
+
+@app.get('/api/walks/{walk_id}/analysis-data')
+def walk_analysis_data(walk_id: str):
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id)
+    return {
+        'walk_id': walk_id,
+        'date': date,
+        'name': walk_name,
+        'payload': payload,
+        'metrics': metrics,
+    }
+
+
+@app.get('/api/walks/{walk_id}/analysis')
+def walk_analysis(walk_id: str):
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id)
+    # Backward-compatible alias for clients that used /analysis.
+    return {
+        'walk_id': walk_id,
+        'date': date,
+        'name': walk_name,
+        'payload': payload,
+        'metrics': metrics,
+    }
+
+
+

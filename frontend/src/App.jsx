@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from 'react'
 import UploadForm from './components/UploadForm'
 import WalkList from './components/WalkList'
+import WalkAnalysisView from './components/WalkAnalysisView'
 
 export default function App() {
   const [walks, setWalks] = useState([])
   const [error, setError] = useState(null)
+  const [selectedWalkId, setSelectedWalkId] = useState(null)
 
   const fetchWalks = useCallback(() => {
     fetch('/api/walks')
@@ -22,8 +24,14 @@ export default function App() {
       </header>
       <main className="app-main">
         {error && <div className="error-banner">{error}</div>}
-        <UploadForm onUploaded={fetchWalks} />
-        <WalkList walks={walks} onDeleted={fetchWalks} />
+        {selectedWalkId ? (
+          <WalkAnalysisView walkId={selectedWalkId} onBack={() => setSelectedWalkId(null)} />
+        ) : (
+          <>
+            <UploadForm onUploaded={fetchWalks} />
+            <WalkList walks={walks} onDeleted={fetchWalks} onView={setSelectedWalkId} />
+          </>
+        )}
       </main>
     </div>
   )

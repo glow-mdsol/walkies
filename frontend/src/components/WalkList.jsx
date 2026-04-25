@@ -9,7 +9,7 @@ function fileIcon(name) {
   return FILE_ICONS[ext] ?? '📄'
 }
 
-function WalkCard({ walk, onDeleted }) {
+function WalkCard({ walk, onDeleted, onView }) {
   const handleDelete = async () => {
     if (!confirm(`Delete walk ${walk.name || walk.date} and all its files?`)) return
     const res = await fetch(`/api/walks/${encodeURIComponent(walk.id)}`, { method: 'DELETE' })
@@ -24,9 +24,7 @@ function WalkCard({ walk, onDeleted }) {
           <span className={walk.name ? 'walk-date-sub' : 'walk-date-main'}>{walk.date}</span>
         </div>
         <div className="walk-actions">
-          <a className="btn-secondary" href={`/api/walks/${encodeURIComponent(walk.id)}/analysis`} target="_blank" rel="noreferrer">
-            View analysis
-          </a>
+          <button className="btn-secondary" onClick={() => onView(walk.id)}>View analysis</button>
           <button className="btn-danger" onClick={handleDelete}>Delete</button>
         </div>
       </div>
@@ -42,7 +40,7 @@ function WalkCard({ walk, onDeleted }) {
   )
 }
 
-export default function WalkList({ walks, onDeleted }) {
+export default function WalkList({ walks, onDeleted, onView }) {
   if (!walks.length) {
     return <p className="empty">No walks yet — upload some files above.</p>
   }
@@ -51,7 +49,7 @@ export default function WalkList({ walks, onDeleted }) {
     <section className="walk-list">
       <h2>Walks</h2>
       {walks.map(w => (
-        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} />
+        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} onView={onView} />
       ))}
     </section>
   )
