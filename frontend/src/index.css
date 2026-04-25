@@ -255,6 +255,78 @@ body {
   padding: 1rem;
 }
 
+.chart-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-bottom: 1rem;
+}
+
+.chart-card-header h2 {
+  margin-bottom: 0;
+}
+
+.chart-card-info {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.15rem;
+  height: 1.15rem;
+  border-radius: 999px;
+  border: 1px solid #cbd5df;
+  color: #516377;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  background: #f8fbfd;
+}
+
+.chart-card-tooltip {
+  position: absolute;
+  left: 50%;
+  top: calc(100% + 0.5rem);
+  transform: translateX(-50%);
+  width: min(320px, 65vw);
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius);
+  background: #1f2937;
+  color: #f9fafb;
+  font-size: 0.78rem;
+  font-weight: 400;
+  line-height: 1.4;
+  text-transform: none;
+  letter-spacing: normal;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.16);
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition: opacity 0.15s ease;
+  z-index: 10;
+}
+
+.chart-card-tooltip::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 100%;
+  transform: translateX(-50%);
+  border: 6px solid transparent;
+  border-bottom-color: #1f2937;
+}
+
+.chart-card-info:hover .chart-card-tooltip,
+.chart-card-info:focus-visible .chart-card-tooltip {
+  opacity: 1;
+  visibility: visible;
+}
+
+.chart-card-info:focus-visible {
+  outline: 2px solid #1f6feb;
+  outline-offset: 2px;
+}
+
 .chart-wrap {
   min-height: 300px;
 }

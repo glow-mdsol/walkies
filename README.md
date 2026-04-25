@@ -16,18 +16,51 @@ The app stores uploaded files by walk date and serves a single analysis view tha
 
 ## Screenshots
 
+### Walk List
 
-### Analysis Charts
+![Walkies walk list](img/walks.png)
 
-![Walkies analysis charts](img/charts.png)
+The landing page lists uploaded walks and gives quick access to analysis views and file management.
 
-This shows the summary charts for the walk, overlaying the distance travelled with the different observables.
+### Analysis Overview
+
+![Walkies analysis overview](img/analysis.png)
+
+The main analysis page aligns activity, glucose, insulin, and environmental data against route distance.
+
+### Glucose And Insulin
+
+![Walkies glucose and insulin chart](img/alt_insulin.png)
+
+This chart combines glucose readings, basal delivery, bolus events, and estimated active bolus insulin so changes in glucose can be interpreted against insulin exposure during the walk.
+
+### Stress And Decoupling
+
+![Walkies stress chart](img/stress.png)
+
+This view compares observed heart rate with expected heart rate and highlights residual strain across the route.
 
 ### Map View
 
 ![Walkies map view](img/map.png)
 
-The map view shows the heart rate overlaid with the map.  There are hour markers to show progress.
+The map view shows the route coloured by heart-rate intensity, with hourly markers to show progress.
+
+## Insulin Profile
+
+Walkies includes a persistent insulin profile so the bolus decay curve can be tailored to the insulin you actually use rather than relying on a fixed generic duration.
+
+### Profile Setup
+
+![Walkies insulin profile setup](img/insulin_prof.png)
+
+The setup screen stores the insulin name, onset, early action, peak window, and total duration range in the browser. This only needs to be configured once unless you want to change the model.
+
+### Profile Applied In Analysis
+
+![Walkies insulin profile in analysis](img/insulin_profsel.png)
+
+The selected insulin profile is then shown in the Glucose and Insulin panel and used to drive the active insulin curve drawn alongside basal and bolus data.
 
 ## Stack
 

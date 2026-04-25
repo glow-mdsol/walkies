@@ -37,10 +37,18 @@ function Stat({ label, value }) {
   )
 }
 
-function ChartCard({ title, children, empty }) {
+function ChartCard({ title, description, children, empty }) {
   return (
     <section className="card chart-card">
-      <h2>{title}</h2>
+      <div className="chart-card-header">
+        <h2>{title}</h2>
+        {description ? (
+          <span className="chart-card-info" tabIndex={0} aria-label={description}>
+            ?
+            <span className="chart-card-tooltip" role="tooltip">{description}</span>
+          </span>
+        ) : null}
+      </div>
       {empty ? <p className="empty">{empty}</p> : <div className="chart-wrap">{children}</div>}
     </section>
   )
@@ -651,12 +659,20 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
         />
       </section>
 
-      <ChartCard title="Route Map" empty={!mapTrack.length ? 'No route map data available.' : null}>
+      <ChartCard
+        title="Route Map"
+        description="Shows the GPS route of the walk, coloured by heart-rate intensity, with hourly position markers where available."
+        empty={!mapTrack.length ? 'No route map data available.' : null}
+      >
         <RouteMap track={mapTrack} hourMarkers={mapHourMarkers} />
       </ChartCard>
 
       <section className="analysis-chart-grid">
-        <ChartCard title="Activity Timeline" empty={!activityRows.length ? 'No activity series available.' : null}>
+        <ChartCard
+          title="Activity Timeline"
+          description="Plots altitude and heart rate against distance so you can see how terrain and effort changed across the walk."
+          empty={!activityRows.length ? 'No activity series available.' : null}
+        >
           <ResponsiveContainer width="100%" height={290}>
             <LineChart data={activityRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
@@ -671,7 +687,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Glucose and Insulin" empty={!glucoseChartRows.length ? 'No BG/insulin points available.' : null}>
+        <ChartCard
+          title="Glucose and Insulin"
+          description="Overlays glucose readings, basal insulin, recorded boluses, and estimated active bolus insulin across the route distance."
+          empty={!glucoseChartRows.length ? 'No BG/insulin points available.' : null}
+        >
           <div className="insulin-controls-panel">
             {insulinProfile && (
               <div className="insulin-profile-badge">
@@ -771,7 +791,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Weather Along Route" empty={!weatherChartRows.length ? 'No weather points available.' : null}>
+        <ChartCard
+          title="Weather Along Route"
+          description="Shows temperature, apparent temperature, wind speed, and headwind exposure over the course of the route."
+          empty={!weatherChartRows.length ? 'No weather points available.' : null}
+        >
           <ResponsiveContainer width="100%" height={290}>
             <ComposedChart data={weatherChartRowsSmoothed} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
@@ -788,7 +812,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Stress and Decoupling" empty={!stressRows.length ? 'No stress analytics series available.' : null}>
+        <ChartCard
+          title="Stress and Decoupling"
+          description="Compares observed heart rate with expected heart rate and highlights the residual gap as a proxy for physiological strain."
+          empty={!stressRows.length ? 'No stress analytics series available.' : null}
+        >
           <ResponsiveContainer width="100%" height={290}>
             <LineChart data={stressRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
@@ -804,7 +832,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard title="Decoupling Trend" empty={!trendRows.length ? 'No trend rows available yet.' : null}>
+        <ChartCard
+          title="Decoupling Trend"
+          description="Summarises how decoupling scores and elevated-strain minutes change across recent walks."
+          empty={!trendRows.length ? 'No trend rows available yet.' : null}
+        >
           <ResponsiveContainer width="100%" height={290}>
             <ComposedChart data={trendChartRows} margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
