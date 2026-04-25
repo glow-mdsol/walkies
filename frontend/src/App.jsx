@@ -2,11 +2,14 @@ import { useState, useEffect, useCallback } from 'react'
 import UploadForm from './components/UploadForm'
 import WalkList from './components/WalkList'
 import WalkAnalysisView from './components/WalkAnalysisView'
+import InsulinSetup, { loadInsulinProfile } from './components/InsulinSetup'
 
 export default function App() {
   const [walks, setWalks] = useState([])
   const [error, setError] = useState(null)
   const [selectedWalkId, setSelectedWalkId] = useState(null)
+  const [showInsulinSetup, setShowInsulinSetup] = useState(false)
+  const [insulinProfile, setInsulinProfile] = useState(() => loadInsulinProfile())
 
   const fetchWalks = useCallback(() => {
     fetch('/api/walks')
@@ -17,15 +20,27 @@ export default function App() {
 
   useEffect(() => { fetchWalks() }, [fetchWalks])
 
+  const handleInsulinBack = () => {
+    setInsulinProfile(loadInsulinProfile())
+    setShowInsulinSetup(false)
+  }
+
   return (
     <div className="app">
       <header className="app-header">
         <h1>Walkies</h1>
+        {!selectedWalkId && !showInsulinSetup && (
+          <button className="btn-header-action" onClick={() => setShowInsulinSetup(true)}>
+            ⚙ Insulin profile
+          </button>
+        )}
       </header>
       <main className="app-main">
         {error && <div className="error-banner">{error}</div>}
-        {selectedWalkId ? (
-          <WalkAnalysisView walkId={selectedWalkId} onBack={() => setSelectedWalkId(null)} />
+        {showInsulinSetup ? (
+          <InsulinSetup onBack={handleInsulinBack} />
+        ) : selectedWalkId ? (
+          <WalkAnalysisView walkId={selectedWalkId} insulinProfile={insulinProfile} onBack={() => setSelectedWalkId(null)} />
         ) : (
           <>
             <UploadForm onUploaded={fetchWalks} />

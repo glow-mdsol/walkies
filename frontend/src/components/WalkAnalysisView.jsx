@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
+import { buildIobFn } from './InsulinSetup'
 import {
   ResponsiveContainer,
+  BarChart,
   LineChart,
   Line,
   Area,
@@ -70,6 +72,35 @@ function bucketSeries(rows, maxPoints) {
     })
   }
   return reduced
+}
+
+function buildDistanceDomain(distances, fallback = [0, 1]) {
+  const clean = distances.filter((v) => v != null)
+  if (!clean.length) return fallback
+
+  const min = Math.min(...clean)
+  const max = Math.max(...clean)
+  const span = Math.max(max - min, 0.2)
+  const buffer = span * 0.05
+  return [min - buffer, max + buffer]
+}
+
+function buildDistanceTicks(domain) {
+  const [start, end] = domain
+  if (end <= start) return [start]
+
+  const count = 7
+  const step = (end - start) / (count - 1)
+  const ticks = Array.from({ length: count }, (_, i) => Number((start + (step * i)).toFixed(2)))
+  if (start < 0 && end > 0 && !ticks.some((v) => Math.abs(v) < 0.01)) {
+    ticks.push(0)
+  }
+  return [...new Set(ticks)].sort((a, b) => a - b)
+}
+
+function formatDistanceTick(value) {
+  if (value < 0) return ''
+  return num(value, 1)
 }
 
 const INSULIN_AXIS_MAX = 10
@@ -209,12 +240,58 @@ function RouteMap({ track, hourMarkers }) {
 const DISTANCE_CHART_MARGIN = { top: 8, right: 8, left: 8, bottom: 8 }
 const DISTANCE_LEFT_Y_WIDTH = 62
 const DISTANCE_RIGHT_Y_WIDTH = 64
+const EFFORT_HR_REFERENCE_DEFAULT = 120
+const EFFORT_HR_REFERENCE_MIN = 90
+const EFFORT_HR_REFERENCE_MAX = 150
+const EFFORT_SCALE_MIN_DEFAULT = 0.6
+const EFFORT_SCALE_MIN_MIN = 0.3
+const EFFORT_SCALE_MIN_MAX = 1.0
+const EFFORT_SCALE_MAX_DEFAULT = 1.8
+const EFFORT_SCALE_MAX_MIN = 1.1
+const EFFORT_SCALE_MAX_MAX = 2.5
+const ANALYTICS_PREFS_KEY = 'walkies.analyticsPrefs.v1'
 
-export default function WalkAnalysisView({ walkId, onBack }) {
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function loadAnalyticsPrefs() {
+  if (typeof window === 'undefined') {
+    return {
+      effortHrReference: EFFORT_HR_REFERENCE_DEFAULT,
+      effortScaleMin: EFFORT_SCALE_MIN_DEFAULT,
+      effortScaleMax: EFFORT_SCALE_MAX_DEFAULT,
+    }
+  }
+
+  try {
+    const raw = window.localStorage.getItem(ANALYTICS_PREFS_KEY)
+    const parsed = raw ? JSON.parse(raw) : {}
+    const effortScaleMin = clamp(Number(parsed.effortScaleMin) || EFFORT_SCALE_MIN_DEFAULT, EFFORT_SCALE_MIN_MIN, EFFORT_SCALE_MIN_MAX)
+    const effortScaleMax = clamp(Number(parsed.effortScaleMax) || EFFORT_SCALE_MAX_DEFAULT, EFFORT_SCALE_MAX_MIN, EFFORT_SCALE_MAX_MAX)
+    return {
+      effortHrReference: clamp(Number(parsed.effortHrReference) || EFFORT_HR_REFERENCE_DEFAULT, EFFORT_HR_REFERENCE_MIN, EFFORT_HR_REFERENCE_MAX),
+      effortScaleMin: Math.min(effortScaleMin, effortScaleMax - 0.1),
+      effortScaleMax: Math.max(effortScaleMax, effortScaleMin + 0.1),
+    }
+  } catch {
+    return {
+      effortHrReference: EFFORT_HR_REFERENCE_DEFAULT,
+      effortScaleMin: EFFORT_SCALE_MIN_DEFAULT,
+      effortScaleMax: EFFORT_SCALE_MAX_DEFAULT,
+    }
+  }
+}
+
+export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
+  const initialPrefs = useMemo(() => loadAnalyticsPrefs(), [])
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(false)
   const [activeDistance, setActiveDistance] = useState(null)
+  const [effortHrReference, setEffortHrReference] = useState(initialPrefs.effortHrReference)
+  const [effortScaleMin, setEffortScaleMin] = useState(initialPrefs.effortScaleMin)
+  const [effortScaleMax, setEffortScaleMax] = useState(initialPrefs.effortScaleMax)
 
   useEffect(() => {
     if (!walkId) return
@@ -233,6 +310,15 @@ export default function WalkAnalysisView({ walkId, onBack }) {
       .catch((err) => setError(err.message || 'Failed to load walk analysis'))
       .finally(() => setLoading(false))
   }, [walkId])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(ANALYTICS_PREFS_KEY, JSON.stringify({
+      effortHrReference,
+      effortScaleMin,
+      effortScaleMax,
+    }))
+  }, [effortHrReference, effortScaleMin, effortScaleMax])
 
   const metrics = data?.metrics || {}
   const payload = data?.payload || {}
@@ -272,9 +358,22 @@ export default function WalkAnalysisView({ walkId, onBack }) {
 
   const glucoseChartRows = useMemo(() => {
     const byDistance = new Map()
+    activityRows.forEach((row) => {
+      if (row.distance_km == null) return
+      byDistance.set(row.distance_km, {
+        distance_km: row.distance_km,
+        timestamp: row.timestamp_iso || null,
+        hr: row.hr ?? null,
+        bg: null,
+        basal: null,
+        bolus: null,
+      })
+    })
     glucoseRows.forEach((row) => {
       byDistance.set(row.distance_km, {
         distance_km: row.distance_km,
+        timestamp: row.timestamp || null,
+        hr: null,
         bg: row.bg,
         basal: null,
         bolus: null,
@@ -282,13 +381,15 @@ export default function WalkAnalysisView({ walkId, onBack }) {
     })
     basalRows.forEach((row) => {
       const key = row.distance_km
-      const existing = byDistance.get(key) || { distance_km: key, bg: null, basal: null, bolus: null }
+      const existing = byDistance.get(key) || { distance_km: key, timestamp: row.timestamp || null, hr: null, bg: null, basal: null, bolus: null }
+      if (!existing.timestamp && row.timestamp) existing.timestamp = row.timestamp
       existing.basal = row.rate
       byDistance.set(key, existing)
     })
     bolusRows.forEach((row) => {
       const key = row.distance_km
-      const existing = byDistance.get(key) || { distance_km: key, bg: null, basal: null, bolus: null }
+      const existing = byDistance.get(key) || { distance_km: key, timestamp: row.timestamp || null, hr: null, bg: null, basal: null, bolus: null }
+      if (!existing.timestamp && row.timestamp) existing.timestamp = row.timestamp
       existing.bolus = row.units
       byDistance.set(key, existing)
     })
@@ -298,7 +399,107 @@ export default function WalkAnalysisView({ walkId, onBack }) {
         bolus_display: row.bolus == null ? null : Math.min(Number(row.bolus), INSULIN_AXIS_MAX),
       }))
       .sort((a, b) => a.distance_km - b.distance_km)
-  }, [glucoseRows, basalRows, bolusRows])
+  }, [activityRows, glucoseRows, basalRows, bolusRows])
+
+  const glucoseInsulinChartRows = useMemo(() => {
+    if (!glucoseChartRows.length) return []
+
+    // Build IOB function from insulin profile
+    const iob = insulinProfile ? buildIobFn(insulinProfile) : null
+    if (!iob) return glucoseChartRows.map((row) => ({ ...row, bolus_decay: null }))
+
+    const durationSecs = ((insulinProfile.durationMinHours + insulinProfile.durationMaxHours) / 2) * 3600
+
+    const bolusEvents = bolusRows
+      .map((row) => ({
+
+        ts: Date.parse(row.timestamp || ''),
+        units: Number(row.units),
+      }))
+      .filter((row) => Number.isFinite(row.ts) && Number.isFinite(row.units) && row.units > 0)
+      .sort((a, b) => a.ts - b.ts)
+
+    if (!bolusEvents.length) {
+      return glucoseChartRows.map((row) => ({ ...row, bolus_decay: null }))
+    }
+
+    const effortScale = (hrValue) => {
+      if (!Number.isFinite(hrValue)) return 1
+      const scaled = hrValue / effortHrReference
+      return Math.max(effortScaleMin, Math.min(effortScaleMax, scaled))
+    }
+
+    const effortSamples = activityRows
+      .map((row) => ({
+        ts: Date.parse(row.timestamp_iso || ''),
+        hr: Number(row.hr),
+      }))
+      .filter((row) => Number.isFinite(row.ts))
+      .sort((a, b) => a.ts - b.ts)
+
+    const cumulativeEffortSeconds = []
+    if (effortSamples.length > 0) {
+      cumulativeEffortSeconds.push(0)
+      for (let i = 1; i < effortSamples.length; i += 1) {
+        const dtSecs = Math.max(0, (effortSamples[i].ts - effortSamples[i - 1].ts) / 1000)
+        const scaleAvg = (effortScale(effortSamples[i - 1].hr) + effortScale(effortSamples[i].hr)) / 2
+        cumulativeEffortSeconds.push(cumulativeEffortSeconds[i - 1] + dtSecs * scaleAvg)
+      }
+    }
+
+    const effortSecondsAt = (ts) => {
+      if (!Number.isFinite(ts) || effortSamples.length === 0) return null
+      if (effortSamples.length === 1) {
+        return ((ts - effortSamples[0].ts) / 1000) * effortScale(effortSamples[0].hr)
+      }
+
+      if (ts <= effortSamples[0].ts) {
+        return ((ts - effortSamples[0].ts) / 1000) * effortScale(effortSamples[0].hr)
+      }
+
+      const lastIdx = effortSamples.length - 1
+      if (ts >= effortSamples[lastIdx].ts) {
+        return cumulativeEffortSeconds[lastIdx]
+          + ((ts - effortSamples[lastIdx].ts) / 1000) * effortScale(effortSamples[lastIdx].hr)
+      }
+
+      let lo = 0
+      let hi = lastIdx
+      while (lo < hi - 1) {
+        const mid = (lo + hi) >> 1
+        if (effortSamples[mid].ts <= ts) lo = mid
+        else hi = mid
+      }
+
+      const segStartTs = effortSamples[lo].ts
+      const segDt = Math.max(1, (effortSamples[hi].ts - segStartTs) / 1000)
+      const frac = Math.max(0, Math.min(1, (ts - segStartTs) / 1000 / segDt))
+      const segScale = (effortScale(effortSamples[lo].hr) + effortScale(effortSamples[hi].hr)) / 2
+      return cumulativeEffortSeconds[lo] + (segDt * frac * segScale)
+    }
+
+    return glucoseChartRows.map((row) => {
+      const rowTs = Date.parse(row.timestamp || '')
+      if (!Number.isFinite(rowTs)) return { ...row, bolus_decay: null }
+
+      const rowEffortSecs = effortSecondsAt(rowTs)
+      if (rowEffortSecs == null) return { ...row, bolus_decay: null }
+
+      let activeUnits = 0
+      for (const event of bolusEvents) {
+        const eventEffortSecs = effortSecondsAt(event.ts)
+        if (eventEffortSecs == null) continue
+        const dtEffortSecs = rowEffortSecs - eventEffortSecs
+        if (dtEffortSecs < 0 || dtEffortSecs > durationSecs) continue
+        activeUnits += event.units * iob(dtEffortSecs)
+      }
+
+      return {
+        ...row,
+        bolus_decay: activeUnits > 0.01 ? Math.min(activeUnits, INSULIN_AXIS_MAX) : null,
+      }
+    })
+  }, [glucoseChartRows, bolusRows, insulinProfile, activityRows, effortHrReference, effortScaleMin, effortScaleMax])
 
   const weatherChartRows = useMemo(() => {
     const byDistance = new Map()
@@ -332,35 +533,19 @@ export default function WalkAnalysisView({ walkId, onBack }) {
   )
 
   const distanceDomain = useMemo(() => {
-    const distances = [
+    if (payload.chartDistanceStart != null && payload.chartDistanceEnd != null) {
+      return [payload.chartDistanceStart, payload.chartDistanceEnd]
+    }
+
+    return buildDistanceDomain([
       ...activityRows.map((row) => row.distance_km),
       ...glucoseChartRows.map((row) => row.distance_km),
       ...weatherChartRows.map((row) => row.distance_km),
       ...stressRows.map((row) => row.distance_km),
-    ].filter((v) => v != null)
+    ])
+  }, [payload.chartDistanceStart, payload.chartDistanceEnd, activityRows, glucoseChartRows, weatherChartRows, stressRows])
 
-    if (!distances.length) return [0, 1]
-
-    const min = Math.min(...distances)
-    const max = Math.max(...distances)
-    const span = Math.max(max - min, 0.2)
-    const buffer = span * 0.05
-    const left = min - buffer
-    const right = max + buffer
-    return [left, right]
-  }, [activityRows, glucoseRows, glucoseChartRows, weatherChartRows, stressRows])
-
-  const distanceTicks = useMemo(() => {
-    const [start, end] = distanceDomain
-    if (end <= start) return [start]
-    const count = 7
-    const step = (end - start) / (count - 1)
-    const ticks = Array.from({ length: count }, (_, i) => Number((start + (step * i)).toFixed(2)))
-    if (start < 0 && end > 0 && !ticks.some((v) => Math.abs(v) < 0.01)) {
-      ticks.push(0)
-    }
-    return [...new Set(ticks)].sort((a, b) => a - b)
-  }, [distanceDomain])
+  const distanceTicks = useMemo(() => buildDistanceTicks(distanceDomain), [distanceDomain])
 
   const trendChartRows = useMemo(
     () => trendRows.map((row, index) => ({ ...row, x_index: index })),
@@ -475,7 +660,7 @@ export default function WalkAnalysisView({ walkId, onBack }) {
           <ResponsiveContainer width="100%" height={290}>
             <LineChart data={activityRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={(v) => num(v, 1)} unit=" km" />
+              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
               <YAxis yAxisId="alt" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit="m" />
               <YAxis yAxisId="hr" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
               <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
@@ -487,9 +672,58 @@ export default function WalkAnalysisView({ walkId, onBack }) {
         </ChartCard>
 
         <ChartCard title="Glucose and Insulin" empty={!glucoseChartRows.length ? 'No BG/insulin points available.' : null}>
+          <div className="insulin-controls-panel">
+            {insulinProfile && (
+              <div className="insulin-profile-badge">
+                <span className="insulin-profile-name">{insulinProfile.name}</span>
+                <span className="insulin-profile-detail">
+                  onset {insulinProfile.onsetMins} min · early action {insulinProfile.earlyActionMins} min ·
+                  peak {num(insulinProfile.peakMinHours, 1)}–{num(insulinProfile.peakMaxHours, 1)} h ·
+                  duration {num(insulinProfile.durationMinHours, 1)}–{num(insulinProfile.durationMaxHours, 1)} h
+                </span>
+              </div>
+            )}
+            <div className="insulin-decay-control">
+              <label htmlFor="effort-hr-reference-range">HR reference: {num(effortHrReference, 0)} bpm</label>
+              <input
+                id="effort-hr-reference-range"
+                type="range"
+                min={EFFORT_HR_REFERENCE_MIN}
+                max={EFFORT_HR_REFERENCE_MAX}
+                step={5}
+                value={effortHrReference}
+                onChange={(e) => setEffortHrReference(Number(e.target.value))}
+              />
+            </div>
+            <div className="insulin-decay-control">
+              <label htmlFor="effort-scale-min-range">Effort floor: {num(effortScaleMin, 2)}x</label>
+              <input
+                id="effort-scale-min-range"
+                type="range"
+                min={EFFORT_SCALE_MIN_MIN}
+                max={Math.min(EFFORT_SCALE_MIN_MAX, effortScaleMax - 0.1)}
+                step={0.05}
+                value={effortScaleMin}
+                onChange={(e) => setEffortScaleMin(Number(e.target.value))}
+              />
+            </div>
+            <div className="insulin-decay-control">
+              <label htmlFor="effort-scale-max-range">Effort ceiling: {num(effortScaleMax, 2)}x</label>
+              <input
+                id="effort-scale-max-range"
+                type="range"
+                min={Math.max(EFFORT_SCALE_MAX_MIN, effortScaleMin + 0.1)}
+                max={EFFORT_SCALE_MAX_MAX}
+                step={0.05}
+                value={effortScaleMax}
+                onChange={(e) => setEffortScaleMax(Number(e.target.value))}
+              />
+            </div>
+            <p className="insulin-controls-note">These analytics controls are saved in this browser. Derived analytics remain computed from source data on demand.</p>
+          </div>
           <ResponsiveContainer width="100%" height={290}>
             <ComposedChart
-              data={glucoseChartRows}
+              data={glucoseInsulinChartRows}
               syncId="distanceSync"
               syncMethod="value"
               margin={DISTANCE_CHART_MARGIN}
@@ -501,7 +735,7 @@ export default function WalkAnalysisView({ walkId, onBack }) {
               onMouseLeave={() => setActiveDistance(null)}
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={(v) => num(v, 1)} unit=" km" />
+              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
               <YAxis yAxisId="bg" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" mmol/L" />
               <YAxis yAxisId="ins" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} domain={[0, INSULIN_AXIS_MAX]} tickFormatter={(v) => num(v, 1)} unit=" U/h" />
               <Tooltip
@@ -510,6 +744,9 @@ export default function WalkAnalysisView({ walkId, onBack }) {
                   if (name === 'Bolus') {
                     return [`${num(item?.payload?.bolus, 1)} U`, name]
                   }
+                  if (name === 'Bolus decay') {
+                    return [`${num(value, 2)} U`, name]
+                  }
                   if (name === 'Basal rate') {
                     return [`${num(value, 2)} U/h`, name]
                   }
@@ -517,8 +754,9 @@ export default function WalkAnalysisView({ walkId, onBack }) {
                 }}
               />
               <Legend />
-              <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} />
+              <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
               <Area yAxisId="ins" type="stepAfter" dataKey="basal" name="Basal rate" stroke="#00745a" fill="rgba(0,116,90,0.22)" connectNulls strokeWidth={1.8} />
+              <Line yAxisId="ins" type="monotone" dataKey="bolus_decay" name="Bolus decay" stroke="#1f6feb" dot={false} strokeWidth={1.8} connectNulls />
               <Bar
                 yAxisId="ins"
                 dataKey="bolus_display"
@@ -537,7 +775,7 @@ export default function WalkAnalysisView({ walkId, onBack }) {
           <ResponsiveContainer width="100%" height={290}>
             <ComposedChart data={weatherChartRowsSmoothed} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={(v) => num(v, 1)} unit=" km" />
+              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
               <YAxis yAxisId="temp" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} domain={['dataMin - 1', 'dataMax + 1']} tickFormatter={(v) => num(v, 1)} unit="°C" />
               <YAxis yAxisId="wind" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" km/h" />
               <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
@@ -554,7 +792,7 @@ export default function WalkAnalysisView({ walkId, onBack }) {
           <ResponsiveContainer width="100%" height={290}>
             <LineChart data={stressRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={(v) => num(v, 1)} unit=" km" />
+              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
               <YAxis yAxisId="hr" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
               <YAxis yAxisId="res" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" bpm" />
               <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
