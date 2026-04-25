@@ -14,6 +14,15 @@ import xml.etree.ElementTree as ET
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+from analytics import (
+    ANALYTICS_VERSION,
+    delete_walk_analytics,
+    init_analytics_db,
+    list_walk_analytics as list_cached_walk_analytics,
+    persist_walk_analytics,
+    refresh_walk_analytics_if_needed,
+)
+
 app = FastAPI()
 
 app.add_middleware(
@@ -27,6 +36,8 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 FIT_EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
+BG_CONTEXT_WINDOW = timedelta(minutes=30)
+init_analytics_db()
 
 
 def _parse_date(date_str: str) -> str:
@@ -1456,13 +1467,14 @@ def delete_walk(walk_id: str):
     if walk_dir is None or not walk_dir.exists():
         raise HTTPException(status_code=404, detail="Walk not found")
     shutil.rmtree(walk_dir)
+    delete_walk_analytics(walk_id)
     parent_dir = walk_dir.parent
     if parent_dir != DATA_DIR and parent_dir.exists() and not any(parent_dir.iterdir()):
         parent_dir.rmdir()
     return {"deleted": walk_id}
 
 
-def _get_walk_analysis_data(walk_id: str) -> tuple[str, str | None, dict, dict]:
+def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tuple[str, str | None, dict, dict]:
     walk_dir = _find_walk_dir(walk_id)
     if walk_dir is None or not walk_dir.exists() or not walk_dir.is_dir():
         raise HTTPException(status_code=404, detail='Walk not found')
@@ -1493,8 +1505,8 @@ def _get_walk_analysis_data(walk_id: str) -> tuple[str, str | None, dict, dict]:
         })
 
     if activity_points:
-        start_dt = datetime.fromisoformat(activity_points[0]['timestamp_iso']) - timedelta(hours=2)
-        end_dt = datetime.fromisoformat(activity_points[-1]['timestamp_iso']) + timedelta(hours=2)
+        start_dt = datetime.fromisoformat(activity_points[0]['timestamp_iso']) - BG_CONTEXT_WINDOW
+        end_dt = datetime.fromisoformat(activity_points[-1]['timestamp_iso']) + BG_CONTEXT_WINDOW
         walk_start_ts = activity_points[0]['timestamp']
         walk_end_ts = activity_points[-1]['timestamp']
         walk_start_unix = datetime.fromisoformat(activity_points[0]['timestamp_iso']).timestamp()
@@ -1512,7 +1524,7 @@ def _get_walk_analysis_data(walk_id: str) -> tuple[str, str | None, dict, dict]:
     ]
     walk_distance_end = max(chart_distance_values) if chart_distance_values else None
     walk_duration_secs = (walk_end_ts - walk_start_ts) if walk_start_ts is not None and walk_end_ts is not None else None
-    bg_buffer_secs = 15 * 60
+    bg_buffer_secs = int(BG_CONTEXT_WINDOW.total_seconds())
     bg_buffer_km = (
         walk_distance_end * (bg_buffer_secs / walk_duration_secs)
         if walk_distance_end is not None and walk_duration_secs and walk_duration_secs > 0
@@ -1773,12 +1785,52 @@ def _get_walk_analysis_data(walk_id: str) -> tuple[str, str | None, dict, dict]:
         'hr_elevated_minutes': stress_analytics['summary'].get('elevated_minutes'),
     })
 
+    if persist_analytics:
+        persist_walk_analytics(walk_dir, walk_meta, payload, metrics)
+
     return date, walk_name, payload, metrics
+
+
+@app.get('/api/analytics/walks')
+def list_walk_analytics():
+    return list_cached_walk_analytics(
+        iter_walk_dirs=_iter_walk_dirs,
+        load_walk_meta=_load_walk_meta,
+    )
+
+
+@app.post('/api/analytics/{walk_id}/refresh')
+def refresh_walk_analytics(walk_id: str, force: bool = False):
+    return refresh_walk_analytics_if_needed(
+        walk_id,
+        force=force,
+        find_walk_dir=_find_walk_dir,
+        get_walk_analysis_data=_get_walk_analysis_data,
+    )
+
+
+@app.post('/api/analytics/backfill')
+def backfill_walk_analytics(force: bool = False):
+    results: list[dict] = []
+    for walk_dir in _iter_walk_dirs():
+        results.append(
+            refresh_walk_analytics_if_needed(
+                walk_dir.name,
+                force=force,
+                find_walk_dir=_find_walk_dir,
+                get_walk_analysis_data=_get_walk_analysis_data,
+            )
+        )
+    return {
+        'analytics_version': ANALYTICS_VERSION,
+        'walk_count': len(results),
+        'results': results,
+    }
 
 
 @app.get('/api/walks/{walk_id}/analysis-data')
 def walk_analysis_data(walk_id: str):
-    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id)
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True)
     return {
         'walk_id': walk_id,
         'date': date,
@@ -1790,7 +1842,7 @@ def walk_analysis_data(walk_id: str):
 
 @app.get('/api/walks/{walk_id}/analysis')
 def walk_analysis(walk_id: str):
-    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id)
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True)
     # Backward-compatible alias for clients that used /analysis.
     return {
         'walk_id': walk_id,
