@@ -12,5 +12,7 @@ frontend/dist/
 # Misc
 .DS_Store
 *.local
+backend/analytics.sqlite3
+backend/analytics.sqlite3-*
 
 data/*
