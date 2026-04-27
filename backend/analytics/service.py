@@ -109,14 +109,29 @@ def analytics_summary_payload(walk_meta: dict, payload: dict, metrics: dict) -> 
     }
 
 
-def persist_walk_analytics(walk_dir: Path, walk_meta: dict, payload: dict, metrics: dict) -> dict:
+def persist_walk_analytics(
+    walk_dir: Path,
+    walk_meta: dict,
+    payload: dict,
+    metrics: dict,
+    route_fingerprint: dict | None = None,
+    route_series: dict | None = None,
+) -> dict:
     source_rows = walk_source_rows(walk_dir)
     source_hash = walk_source_hash(source_rows)
     summary = analytics_summary_payload(walk_meta, payload, metrics)
     computed_at = datetime.now(timezone.utc).isoformat()
 
     upsert_walk_sources(walk_meta["id"], source_rows)
-    upsert_walk_analytics(walk_meta, source_hash, computed_at, metrics, summary)
+    upsert_walk_analytics(
+        walk_meta,
+        source_hash,
+        computed_at,
+        metrics,
+        summary,
+        route_fingerprint=route_fingerprint,
+        route_series=route_series,
+    )
 
     return {
         "walk_id": walk_meta["id"],

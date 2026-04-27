@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ANALYTICS_DB_PATH = Path(__file__).resolve().parent.parent / "analytics.sqlite3"
-ANALYTICS_VERSION = "2026-04-25-v1"
+ANALYTICS_VERSION = "2026-04-26-v1"
 
 
 def analytics_conn() -> sqlite3.Connection:
@@ -44,13 +44,24 @@ def init_analytics_db() -> None:
                 weather_stress_score REAL,
                 hr_decoupling_score REAL,
                 metrics_json TEXT NOT NULL,
-                summary_json TEXT NOT NULL
+                summary_json TEXT NOT NULL,
+                route_fingerprint_json TEXT,
+                route_series_json TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_walk_analytics_order
                 ON walk_analytics(start_time DESC, walk_date DESC, walk_id DESC);
             """
         )
+        # Idempotent migrations for older DB files that predate these columns.
+        for col, typedef in [
+            ("route_fingerprint_json", "TEXT"),
+            ("route_series_json", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE walk_analytics ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
 
 def upsert_walk_sources(walk_id: str, source_rows: list[dict]) -> None:
@@ -81,6 +92,8 @@ def upsert_walk_analytics(
     computed_at: str,
     metrics: dict,
     summary: dict,
+    route_fingerprint: dict | None = None,
+    route_series: dict | None = None,
 ) -> None:
     with analytics_conn() as conn:
         conn.execute(
@@ -88,9 +101,10 @@ def upsert_walk_analytics(
             INSERT INTO walk_analytics (
                 walk_id, walk_date, walk_name, start_time, source_hash, analytics_version, computed_at,
                 distance_km, duration_h, avg_hr, bg_delta, tir_pct, bolus_units,
-                weather_stress_score, hr_decoupling_score, metrics_json, summary_json
+                weather_stress_score, hr_decoupling_score, metrics_json, summary_json,
+                route_fingerprint_json, route_series_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(walk_id) DO UPDATE SET
                 walk_date = excluded.walk_date,
                 walk_name = excluded.walk_name,
@@ -107,7 +121,9 @@ def upsert_walk_analytics(
                 weather_stress_score = excluded.weather_stress_score,
                 hr_decoupling_score = excluded.hr_decoupling_score,
                 metrics_json = excluded.metrics_json,
-                summary_json = excluded.summary_json
+                summary_json = excluded.summary_json,
+                route_fingerprint_json = excluded.route_fingerprint_json,
+                route_series_json = excluded.route_series_json
             """,
             (
                 walk_meta["id"],
@@ -127,6 +143,8 @@ def upsert_walk_analytics(
                 metrics.get("hr_decoupling_score"),
                 json.dumps(metrics),
                 json.dumps(summary),
+                json.dumps(route_fingerprint) if route_fingerprint is not None else None,
+                json.dumps(route_series) if route_series is not None else None,
             ),
         )
 
@@ -156,6 +174,8 @@ def analytics_row_to_dict(row: sqlite3.Row) -> dict:
         "hr_decoupling_score": row["hr_decoupling_score"],
         "metrics": json.loads(row["metrics_json"]),
         "summary": json.loads(row["summary_json"]),
+        "route_fingerprint": json.loads(row["route_fingerprint_json"]) if row["route_fingerprint_json"] else None,
+        "route_series": json.loads(row["route_series_json"]) if row["route_series_json"] else None,
     }
 
 
@@ -163,3 +183,11 @@ def get_cached_analytics_row(walk_id: str) -> dict | None:
     with analytics_conn() as conn:
         row = conn.execute("SELECT * FROM walk_analytics WHERE walk_id = ?", (walk_id,)).fetchone()
     return analytics_row_to_dict(row) if row else None
+
+
+def list_all_analytics_rows() -> list[dict]:
+    with analytics_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM walk_analytics ORDER BY start_time DESC, walk_date DESC, walk_id DESC"
+        ).fetchall()
+    return [analytics_row_to_dict(row) for row in rows]

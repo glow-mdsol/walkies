@@ -11,13 +11,15 @@ from pathlib import Path
 from typing import List, Optional
 import xml.etree.ElementTree as ET
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from analytics import (
     ANALYTICS_VERSION,
     delete_walk_analytics,
+    get_cached_analytics_row,
     init_analytics_db,
+    list_all_analytics_rows,
     list_walk_analytics as list_cached_walk_analytics,
     persist_walk_analytics,
     refresh_walk_analytics_if_needed,
@@ -977,6 +979,159 @@ def _ang_diff_deg(a: float, b: float) -> float:
     return ((a - b + 180.0) % 360.0) - 180.0
 
 
+def _compute_route_fingerprint(map_track: list[list[float]], distance_km: float | None) -> dict | None:
+    if not map_track or len(map_track) < 2 or not distance_km:
+        return None
+    lats = [p[0] for p in map_track]
+    lons = [p[1] for p in map_track]
+    step = max(1, len(map_track) // 40)
+    simplified = [[round(p[0], 6), round(p[1], 6)] for p in map_track[::step]]
+    last = [round(map_track[-1][0], 6), round(map_track[-1][1], 6)]
+    if simplified[-1] != last:
+        simplified.append(last)
+    return {
+        "start_lat": round(map_track[0][0], 6),
+        "start_lon": round(map_track[0][1], 6),
+        "end_lat": round(map_track[-1][0], 6),
+        "end_lon": round(map_track[-1][1], 6),
+        "distance_km": round(distance_km, 2),
+        "bbox": [round(min(lats), 5), round(min(lons), 5), round(max(lats), 5), round(max(lons), 5)],
+        "simplified_track": simplified,
+    }
+
+
+def _longest_shared_segment_km(
+    track_a: list[list[float]],
+    dist_a: float,
+    track_b: list[list[float]],
+    threshold_km: float = 0.25,
+) -> float:
+    """Length of the longest contiguous run of track_a points each within threshold_km of some point on track_b."""
+    if not track_a or not track_b or not dist_a or len(track_a) < 2:
+        return 0.0
+    km_per_pt = dist_a / (len(track_a) - 1)
+    max_run = 0
+    cur = 0
+    for pa in track_a:
+        if any(_haversine_km(pa[0], pa[1], pb[0], pb[1]) <= threshold_km for pb in track_b):
+            cur += 1
+            max_run = max(max_run, cur)
+        else:
+            cur = 0
+    return max_run * km_per_pt
+
+
+def _routes_similar(a: dict, b: dict) -> bool:
+    # Start points within 500 m — allows for different car parks or trail heads in the same area.
+    if _haversine_km(a["start_lat"], a["start_lon"], b["start_lat"], b["start_lon"]) > 0.5:
+        return False
+    track_a = a.get("simplified_track") or []
+    track_b = b.get("simplified_track") or []
+    if track_a and track_b:
+        # Match if the longest shared contiguous segment is >= 3 km.
+        # This handles sub-routes and diverging walks: two walks sharing 7 km out of Ambleside
+        # before heading different ways will still be grouped together.
+        dist_a = a.get("distance_km") or 0.0
+        dist_b = b.get("distance_km") or 0.0
+        seg_ab = _longest_shared_segment_km(track_a, dist_a, track_b)
+        seg_ba = _longest_shared_segment_km(track_b, dist_b, track_a)
+        return max(seg_ab, seg_ba) >= 3.0
+    # Fallback when no track data: require matching end point + similar distance.
+    if not a.get("distance_km") or not b.get("distance_km"):
+        return False
+    if _haversine_km(a["end_lat"], a["end_lon"], b["end_lat"], b["end_lon"]) > 0.3:
+        return False
+    avg = (a["distance_km"] + b["distance_km"]) / 2
+    return abs(a["distance_km"] - b["distance_km"]) / avg <= 0.20
+
+
+def _build_route_groups(rows: list[dict]) -> list[list[dict]]:
+    """Union-find clustering of walks by route overlap. Returns groups of ≥2 walks, oldest-first."""
+    n = len(rows)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        parent[find(i)] = find(j)
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _routes_similar(rows[i]['route_fingerprint'], rows[j]['route_fingerprint']):
+                union(i, j)
+
+    buckets: dict[int, list[dict]] = {}
+    for i, row in enumerate(rows):
+        buckets.setdefault(find(i), []).append(row)
+
+    result = []
+    for group_rows in buckets.values():
+        if len(group_rows) >= 2:
+            result.append(sorted(group_rows, key=lambda r: (r.get('start_time') or '', r.get('date') or '', r.get('walk_id') or '')))
+    return result
+
+
+def _sample_at_distances(pairs: list[tuple[float, float]], sample_dists: list[float]) -> list[float | None]:
+    if not pairs:
+        return [None] * len(sample_dists)
+    pairs = sorted(pairs, key=lambda p: p[0])
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    result: list[float | None] = []
+    for d in sample_dists:
+        if d <= xs[0]:
+            result.append(round(ys[0], 2))
+        elif d >= xs[-1]:
+            result.append(round(ys[-1], 2))
+        else:
+            lo, hi = 0, len(xs) - 1
+            while lo < hi - 1:
+                mid = (lo + hi) // 2
+                if xs[mid] <= d:
+                    lo = mid
+                else:
+                    hi = mid
+            t = (d - xs[lo]) / (xs[hi] - xs[lo]) if xs[hi] != xs[lo] else 0.0
+            result.append(round(ys[lo] + t * (ys[hi] - ys[lo]), 2))
+    return result
+
+
+def _compute_route_series(
+    activity_points: list[dict],
+    bg_points: list[dict],
+    weather_points: list[dict],
+    distance_km: float,
+) -> dict:
+    n = 50
+    dists = [round(i * distance_km / (n - 1), 3) for i in range(n)]
+    hr_pairs = [
+        (p["distance_m"] / 1000.0, p["hr"])
+        for p in activity_points if p.get("distance_m") is not None and p.get("hr") is not None
+    ]
+    alt_pairs = [
+        (p["distance_m"] / 1000.0, p["altitude_m"])
+        for p in activity_points if p.get("distance_m") is not None and p.get("altitude_m") is not None
+    ]
+    bg_pairs = [
+        (p["distance_km"], p["bg"])
+        for p in bg_points if p.get("distance_km") is not None and p.get("bg") is not None and p["distance_km"] >= 0
+    ]
+    temp_pairs = [(p["distance_km"], p["temp_c"]) for p in weather_points if p.get("temp_c") is not None]
+    wind_pairs = [(p["distance_km"], p["wind_kph"]) for p in weather_points if p.get("wind_kph") is not None]
+    return {
+        "distances": dists,
+        "hr": _sample_at_distances(hr_pairs, dists),
+        "altitude_m": _sample_at_distances(alt_pairs, dists),
+        "bg": _sample_at_distances(bg_pairs, dists),
+        "temp_c": _sample_at_distances(temp_pairs, dists),
+        "wind_kph": _sample_at_distances(wind_pairs, dists),
+    }
+
+
 def _weather_interp(ts: float, weather_pairs: list[tuple[float, dict]]) -> dict | None:
     if not weather_pairs:
         return None
@@ -1366,11 +1521,43 @@ async def parse_fit_date(file: UploadFile = File(...)):
     return {"date": date_str}
 
 
+def _prefetch_analytics_background(walk_ids: list[str]) -> None:
+    for walk_id in walk_ids:
+        try:
+            refresh_walk_analytics_if_needed(
+                walk_id,
+                find_walk_dir=_find_walk_dir,
+                get_walk_analysis_data=_get_walk_analysis_data,
+            )
+        except Exception:
+            pass
+
+
 @app.get("/api/walks")
-def list_walks():
+def list_walks(background_tasks: BackgroundTasks):
     walks = []
+    uncached_ids: list[str] = []
     for walk_dir in _iter_walk_dirs():
-        walks.append(_load_walk_meta(walk_dir))
+        meta = _load_walk_meta(walk_dir)
+        cached = get_cached_analytics_row(meta["id"])
+        needs_prefetch = (
+            cached is None or cached["analytics_version"] != ANALYTICS_VERSION
+        ) and any(walk_dir.glob("*.fit"))
+        if needs_prefetch:
+            uncached_ids.append(meta["id"])
+        if cached and cached.get("analytics_version") == ANALYTICS_VERSION:
+            meta["metrics"] = {
+                "distance_km": cached.get("distance_km"),
+                "duration_h": cached.get("duration_h"),
+                "avg_hr": cached.get("avg_hr"),
+                "bg_delta": cached.get("bg_delta"),
+                "tir_pct": cached.get("tir_pct"),
+            }
+        else:
+            meta["metrics"] = None
+        walks.append(meta)
+    if uncached_ids:
+        background_tasks.add_task(_prefetch_analytics_background, uncached_ids)
     walks.sort(key=lambda walk: (walk.get("start_time") or "", walk["date"], walk["id"]), reverse=True)
     return walks
 
@@ -1785,8 +1972,16 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
         'hr_elevated_minutes': stress_analytics['summary'].get('elevated_minutes'),
     })
 
+    route_fingerprint = _compute_route_fingerprint(map_track, metrics.get("distance_km"))
+    route_series = (
+        _compute_route_series(activity_points, bg_points, weather_points, metrics["distance_km"])
+        if route_fingerprint and metrics.get("distance_km")
+        else None
+    )
+
     if persist_analytics:
-        persist_walk_analytics(walk_dir, walk_meta, payload, metrics)
+        persist_walk_analytics(walk_dir, walk_meta, payload, metrics,
+                               route_fingerprint=route_fingerprint, route_series=route_series)
 
     return date, walk_name, payload, metrics
 
@@ -1831,12 +2026,15 @@ def backfill_walk_analytics(force: bool = False):
 @app.get('/api/walks/{walk_id}/analysis-data')
 def walk_analysis_data(walk_id: str):
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True)
+    walk_dir = _find_walk_dir(walk_id)
+    files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
     return {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
         'payload': payload,
         'metrics': metrics,
+        'files': files,
     }
 
 
@@ -1853,4 +2051,69 @@ def walk_analysis(walk_id: str):
     }
 
 
+def _walk_summary_row(r: dict) -> dict:
+    m = r.get('metrics') or {}
+    return {
+        'walk_id': r['walk_id'],
+        'date': r['date'],
+        'name': r['name'],
+        'start_time': r['start_time'],
+        'distance_km': r['distance_km'],
+        'avg_hr': r['avg_hr'],
+        'bg_delta': r['bg_delta'],
+        'tir_pct': r['tir_pct'],
+        'temp_avg_c': m.get('temp_avg_c'),
+        'wind_avg_kph': m.get('wind_avg_kph'),
+        'weather_stress_band': m.get('weather_stress_band'),
+    }
 
+
+@app.get('/api/analytics/routes')
+def list_route_groups():
+    rows = [r for r in list_all_analytics_rows() if r.get('route_fingerprint')]
+    groups = _build_route_groups(rows)
+    result = []
+    for group_walks in groups:
+        # group_id = oldest walk's walk_id; stable as long as that walk exists
+        group_id = group_walks[0]['walk_id']
+        fp = group_walks[0]['route_fingerprint']
+        dists = [r['route_fingerprint']['distance_km'] for r in group_walks if r['route_fingerprint'].get('distance_km')]
+        avg_dist = sum(dists) / len(dists) if dists else None
+        result.append({
+            'group_id': group_id,
+            'walk_count': len(group_walks),
+            'avg_distance_km': round(avg_dist, 2) if avg_dist else None,
+            'simplified_track': fp.get('simplified_track'),
+            'walks': [_walk_summary_row(r) for r in group_walks],
+        })
+    result.sort(key=lambda g: (-g['walk_count'], g.get('avg_distance_km') or 0))
+    return result
+
+
+@app.get('/api/analytics/routes/{group_id}/compare')
+def route_compare(group_id: str):
+    rows = [r for r in list_all_analytics_rows() if r.get('route_fingerprint')]
+    groups = _build_route_groups(rows)
+    group_walks = next((g for g in groups if g[0]['walk_id'] == group_id), None)
+    if group_walks is None:
+        raise HTTPException(status_code=404, detail='Route group not found')
+    return {
+        'group_id': group_id,
+        'walks': [
+            {
+                **_walk_summary_row(r),
+                'metrics': {
+                    'distance_km': r['distance_km'],
+                    'avg_hr': r['avg_hr'],
+                    'bg_delta': r['bg_delta'],
+                    'tir_pct': r['tir_pct'],
+                    'temp_avg_c': (r.get('metrics') or {}).get('temp_avg_c'),
+                    'wind_avg_kph': (r.get('metrics') or {}).get('wind_avg_kph'),
+                    'weather_stress_band': (r.get('metrics') or {}).get('weather_stress_band'),
+                },
+                'route_series': r.get('route_series'),
+                'track': (r.get('route_fingerprint') or {}).get('simplified_track'),
+            }
+            for r in group_walks
+        ],
+    }
