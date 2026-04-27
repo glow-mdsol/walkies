@@ -291,7 +291,7 @@ function loadAnalyticsPrefs() {
   }
 }
 
-export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
+export default function WalkAnalysisView({ walkId, insulinProfile }) {
   const initialPrefs = useMemo(() => loadAnalyticsPrefs(), [])
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -612,9 +612,6 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
   if (loading) {
     return (
       <section className="card">
-        <div className="analysis-toolbar">
-          <button className="btn-secondary" onClick={onBack}>Back to walks</button>
-        </div>
         <p className="empty">Loading analysis...</p>
       </section>
     )
@@ -623,10 +620,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
   if (error) {
     return (
       <section className="card">
-        <div className="analysis-toolbar">
-          <button className="btn-secondary" onClick={onBack}>Back to walks</button>
-        </div>
-        <p className="msg-error">{error}</p>
+        <p className="msg-error" style={{ padding: '1rem' }}>{error}</p>
       </section>
     )
   }
@@ -637,14 +631,17 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
 
   const walkTitle = data.name || data.date || walkId
 
+  const distStr = metrics.distance_km != null ? `${fmt(metrics.distance_km, 2)} km` : null
+  const durStr = metrics.duration_h != null ? `${fmt(metrics.duration_h, 1)} h` : null
+  const subtitleParts = [data.date, distStr, durStr].filter(Boolean)
+
   return (
     <section className="analysis-view">
       <section className="card analysis-header-card">
-        <div className="analysis-toolbar">
-          <button className="btn-secondary" onClick={onBack}>Back to walks</button>
-        </div>
-        <h2>{walkTitle}</h2>
-        <p className="analysis-subtitle">{data.date}</p>
+        <h2 style={{ fontSize: '1.4rem', fontWeight: 700, letterSpacing: 'normal', textTransform: 'none', color: 'var(--text)', marginBottom: '0.35rem' }}>
+          {walkTitle}
+        </h2>
+        <p className="analysis-subtitle">{subtitleParts.join(' · ')}</p>
       </section>
 
       <section className="analysis-stats-grid">
@@ -989,6 +986,20 @@ export default function WalkAnalysisView({ walkId, insulinProfile, onBack }) {
           <strong>{fmt(stressSummary.max_residual_bpm, 1, ' bpm')}</strong>
         </div>
       </section>
+
+      {data.files?.length > 0 && (
+        <section className="card">
+          <h2>Files</h2>
+          <ul className="file-list">
+            {data.files.map(f => (
+              <li key={f}>
+                <span className="file-icon">{f.endsWith('.fit') ? '🏃' : f.endsWith('.csv') ? '📊' : f.endsWith('.gpx') ? '🗺️' : '📄'}</span>
+                {f}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <section className="card">
         <h2>Recent Stress Trend</h2>

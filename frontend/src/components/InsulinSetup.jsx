@@ -102,7 +102,7 @@ function FieldRow({ label, hint, children }) {
   )
 }
 
-export default function InsulinSetup({ onBack }) {
+export default function InsulinSetup() {
   const [form, setForm] = useState(() => loadInsulinProfile())
   const [saved, setSaved] = useState(false)
 
@@ -146,7 +146,6 @@ export default function InsulinSetup({ onBack }) {
   return (
     <div className="insulin-setup">
       <div className="insulin-setup-header">
-        <button className="btn-back" onClick={onBack}>← Back</button>
         <h2>Insulin Profile</h2>
       </div>
 

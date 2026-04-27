@@ -1,15 +1,33 @@
-const FILE_ICONS = {
-  fit: '🏃',
-  csv: '📊',
-  gpx: '🗺️',
+function fmt(v, d = 1, s = '') {
+  if (v == null || Number.isNaN(v)) return null
+  return `${Number(v).toFixed(d)}${s}`
 }
 
-function fileIcon(name) {
-  const ext = name.split('.').pop().toLowerCase()
-  return FILE_ICONS[ext] ?? '📄'
+function fmtDuration(h) {
+  if (h == null) return null
+  const hours = Math.floor(h)
+  const mins = Math.round((h - hours) * 60)
+  return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`
+}
+
+function fmtBgDelta(v) {
+  if (v == null) return null
+  return `${v > 0 ? '+' : ''}${Number(v).toFixed(1)} mmol/L`
+}
+
+function MetricPill({ label, value }) {
+  if (value == null) return null
+  return (
+    <span className="metric-pill">
+      <span className="metric-pill-label">{label}</span>
+      <span className="metric-pill-value">{value}</span>
+    </span>
+  )
 }
 
 function WalkCard({ walk, onDeleted, onView }) {
+  const m = walk.metrics
+
   const handleDelete = async () => {
     if (!confirm(`Delete walk ${walk.name || walk.date} and all its files?`)) return
     const res = await fetch(`/api/walks/${encodeURIComponent(walk.id)}`, { method: 'DELETE' })
@@ -28,14 +46,17 @@ function WalkCard({ walk, onDeleted, onView }) {
           <button className="btn-danger" onClick={handleDelete}>Delete</button>
         </div>
       </div>
-      <ul className="file-list">
-        {walk.files.map(f => (
-          <li key={f}>
-            <span className="file-icon">{fileIcon(f)}</span>
-            {f}
-          </li>
-        ))}
-      </ul>
+      {m ? (
+        <div className="metric-pills">
+          <MetricPill label="Distance" value={fmt(m.distance_km, 1, ' km')} />
+          <MetricPill label="Duration" value={fmtDuration(m.duration_h)} />
+          <MetricPill label="Avg HR" value={fmt(m.avg_hr, 0, ' bpm')} />
+          <MetricPill label="BG Δ" value={fmtBgDelta(m.bg_delta)} />
+          <MetricPill label="TiR" value={fmt(m.tir_pct, 0, '%')} />
+        </div>
+      ) : (
+        <p className="metric-pills-empty">Analytics computing…</p>
+      )}
     </article>
   )
 }
@@ -47,7 +68,6 @@ export default function WalkList({ walks, onDeleted, onView }) {
 
   return (
     <section className="walk-list">
-      <h2>Walks</h2>
       {walks.map(w => (
         <WalkCard key={w.id} walk={w} onDeleted={onDeleted} onView={onView} />
       ))}
