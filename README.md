@@ -84,22 +84,60 @@ walkies/
 └── README.md
 ```
 
-## Requirements
+## Installation
 
-- Python 3.11+
-- Node.js
-- `uv`
-- `task`
+### Prerequisites
 
-## Getting Started
+**Python 3.11+**
 
-Install dependencies:
+Check your version with `python --version`. Download from [python.org](https://www.python.org/downloads/) if needed.
+
+**Node.js (LTS)**
+
+Check with `node --version`. Download from [nodejs.org](https://nodejs.org/).
+
+**uv** (Python package manager)
 
 ```bash
+# macOS / Linux
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+winget install astral-sh.uv
+```
+
+Or see the [uv installation docs](https://docs.astral.sh/uv/getting-started/installation/).
+
+**task** (task runner)
+
+```bash
+# macOS
+brew install go-task
+
+# Windows
+winget install Task.Task
+
+# Linux
+sh -c "$(curl --location https://taskfile.dev/install.sh)" -- -d -b ~/.local/bin
+```
+
+Or see the [Taskfile installation docs](https://taskfile.dev/installation/).
+
+---
+
+### Setup
+
+Clone the repo and install all dependencies in one step:
+
+```bash
+git clone <repo-url>
+cd walkies
 task install
 ```
 
-Run both backend and frontend in development mode:
+This runs `uv sync` in `backend/` and `npm install` in `frontend/`.
+
+### Running
 
 ```bash
 task
@@ -110,7 +148,7 @@ This starts:
 - FastAPI on `http://localhost:8000`
 - Vite on `http://localhost:5173`
 
-The frontend uses the Vite dev proxy for `/api`, so requests are forwarded to the backend in development.
+Open `http://localhost:5173` in your browser. The Vite dev proxy forwards `/api` to the backend, so no CORS configuration is needed.
 
 ## Available Tasks
 
