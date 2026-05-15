@@ -1,0 +1,44 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      WALKIES_DEV_BYPASS_AUTH: ${WALKIES_DEV_BYPASS_AUTH:-0}
+      ANALYTICS_DB_URL: ${ANALYTICS_DB_URL:-postgresql://walkies:walkies@postgres:5432/walkies}
+    volumes:
+      - walkies-data:/app/backend/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    expose:
+      - "8000"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-walkies}
+      POSTGRES_USER: ${POSTGRES_USER:-walkies}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-walkies}
+    volumes:
+      - walkies-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-walkies} -d $${POSTGRES_DB:-walkies}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID:-}
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  walkies-data:
+  walkies-postgres:

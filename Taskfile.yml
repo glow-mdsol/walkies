@@ -42,3 +42,24 @@ tasks:
     dir: frontend
     cmds:
       - npm run build
+
+  docker:build:
+    desc: Build the backend and frontend Docker images
+    cmds:
+      - docker compose build
+
+  docker:up:
+    desc: Build and start the Docker Compose stack
+    cmds:
+      - docker compose up --build
+
+  docker:down:
+    desc: Stop the Docker Compose stack
+    cmds:
+      - docker compose down
+
+  analytics:migrate:
+    desc: Migrate analytics/share-link data from legacy sqlite into configured analytics backend
+    dir: backend
+    cmds:
+      - uv run python -m analytics.migrate

@@ -16,3 +16,12 @@ backend/analytics.sqlite3
 backend/analytics.sqlite3-*
 
 data/*
+
+# Environment variables
+.env
+.local.env
+
+# Ignore the secret client credentials for Google API
+client_secret*.json
+
+.claude/

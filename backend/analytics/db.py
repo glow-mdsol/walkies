@@ -1,16 +1,15 @@
 import json
-import sqlite3
 from pathlib import Path
 
+from .adapter import build_analytics_adapter
 
 ANALYTICS_DB_PATH = Path(__file__).resolve().parent.parent / "analytics.sqlite3"
-ANALYTICS_VERSION = "2026-04-26-v1"
+ANALYTICS_VERSION = "2026-05-05-v2"
+ANALYTICS_ADAPTER = build_analytics_adapter(ANALYTICS_DB_PATH)
 
 
-def analytics_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(ANALYTICS_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def analytics_conn():
+    return ANALYTICS_ADAPTER.connect()
 
 
 def init_analytics_db() -> None:
@@ -51,6 +50,18 @@ def init_analytics_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_walk_analytics_order
                 ON walk_analytics(start_time DESC, walk_date DESC, walk_id DESC);
+
+            CREATE TABLE IF NOT EXISTS share_links (
+                token TEXT PRIMARY KEY,
+                owner_sub TEXT NOT NULL,
+                walk_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                revoked_at TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_share_links_owner_walk
+                ON share_links(owner_sub, walk_id, created_at DESC);
             """
         )
         # Idempotent migrations for older DB files that predate these columns.
@@ -60,7 +71,7 @@ def init_analytics_db() -> None:
         ]:
             try:
                 conn.execute(f"ALTER TABLE walk_analytics ADD COLUMN {col} {typedef}")
-            except sqlite3.OperationalError:
+            except Exception:
                 pass  # column already exists
 
 
@@ -155,7 +166,7 @@ def delete_walk_analytics(walk_id: str) -> None:
         conn.execute("DELETE FROM walk_analytics WHERE walk_id = ?", (walk_id,))
 
 
-def analytics_row_to_dict(row: sqlite3.Row) -> dict:
+def analytics_row_to_dict(row) -> dict:
     return {
         "walk_id": row["walk_id"],
         "date": row["walk_date"],
@@ -191,3 +202,78 @@ def list_all_analytics_rows() -> list[dict]:
             "SELECT * FROM walk_analytics ORDER BY start_time DESC, walk_date DESC, walk_id DESC"
         ).fetchall()
     return [analytics_row_to_dict(row) for row in rows]
+
+
+def create_share_link(token: str, owner_sub: str, walk_id: str, created_at: str, expires_at: str | None = None) -> None:
+    with analytics_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO share_links (token, owner_sub, walk_id, created_at, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            (token, owner_sub, walk_id, created_at, expires_at),
+        )
+
+
+def upsert_share_link(
+    token: str,
+    owner_sub: str,
+    walk_id: str,
+    created_at: str,
+    expires_at: str | None = None,
+    revoked_at: str | None = None,
+) -> None:
+    with analytics_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO share_links (token, owner_sub, walk_id, created_at, expires_at, revoked_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(token) DO UPDATE SET
+                owner_sub = excluded.owner_sub,
+                walk_id = excluded.walk_id,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                revoked_at = excluded.revoked_at
+            """,
+            (token, owner_sub, walk_id, created_at, expires_at, revoked_at),
+        )
+
+
+def list_share_links_for_walk(owner_sub: str, walk_id: str) -> list[dict]:
+    with analytics_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT token, owner_sub, walk_id, created_at, expires_at, revoked_at
+            FROM share_links
+            WHERE owner_sub = ? AND walk_id = ?
+            ORDER BY created_at DESC
+            """,
+            (owner_sub, walk_id),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_share_link(token: str) -> dict | None:
+    with analytics_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT token, owner_sub, walk_id, created_at, expires_at, revoked_at
+            FROM share_links
+            WHERE token = ?
+            """,
+            (token,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def revoke_share_link(token: str, owner_sub: str, revoked_at: str) -> bool:
+    with analytics_conn() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE share_links
+            SET revoked_at = ?
+            WHERE token = ? AND owner_sub = ? AND revoked_at IS NULL
+            """,
+            (revoked_at, token, owner_sub),
+        )
+        return cursor.rowcount > 0

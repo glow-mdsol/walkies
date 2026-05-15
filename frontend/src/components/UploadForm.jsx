@@ -2,7 +2,7 @@ import { useState } from 'react'
 
 const today = () => new Date().toISOString().slice(0, 10)
 
-export default function UploadForm({ onUploaded }) {
+export default function UploadForm({ onUploaded, apiFetch }) {
   const [name, setName] = useState('')
   const [date, setDate] = useState(today)
   const [dateSource, setDateSource] = useState(null) // 'fit' | null
@@ -21,7 +21,7 @@ export default function UploadForm({ onUploaded }) {
     const form = new FormData()
     form.append('file', file)
     try {
-      const res = await fetch('/api/walks/parse-fit-date', { method: 'POST', body: form })
+      const res = await apiFetch('/api/walks/parse-fit-date', { method: 'POST', body: form })
       if (res.ok) {
         const { date: detected } = await res.json()
         setDate(detected)
@@ -45,7 +45,7 @@ export default function UploadForm({ onUploaded }) {
     if (gpxFile) form.append('files', gpxFile)
 
     try {
-      const res = await fetch('/api/walks/upload', { method: 'POST', body: form })
+      const res = await apiFetch('/api/walks/upload', { method: 'POST', body: form })
       if (!res.ok) throw new Error((await res.json()).detail)
       const data = await res.json()
       const uploadedCount = data.uploaded?.length ?? 0

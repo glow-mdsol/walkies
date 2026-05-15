@@ -61,6 +61,8 @@ def analytics_summary_payload(walk_meta: dict, payload: dict, metrics: dict) -> 
     phase_rows = payload.get("phaseAnalytics", {}).get("phases", []) or []
     intensity_rows = payload.get("intensityAnalytics", []) or []
     stress_summary = payload.get("stressAnalytics", {}).get("summary", {}) or {}
+    insulin_stress_summary = payload.get("insulinStressEffect", {}).get("summary", {}) or {}
+    smartguard_summary = payload.get("smartguard", {}).get("summary", {}) or {}
     glucose_values = [point.get("bg") for point in payload.get("bg", []) if point.get("bg") is not None]
     dominant_zone = None
     if intensity_rows:
@@ -87,6 +89,16 @@ def analytics_summary_payload(walk_meta: dict, payload: dict, metrics: dict) -> 
             "bolus_units": metrics.get("bolus_units"),
             "bolus_event_count": len(payload.get("bolus", []) or []),
             "basal_sample_count": len(payload.get("basal", []) or []),
+            "stress_multiplier": insulin_stress_summary.get("stress_multiplier"),
+            "stress_band": insulin_stress_summary.get("band"),
+            "iob_overlap_minutes": insulin_stress_summary.get("overlap_minutes"),
+        },
+        "smartguard": {
+            "event_count": smartguard_summary.get("event_count"),
+            "predicted_low_suspend_count": smartguard_summary.get("predicted_low_suspend_count"),
+            "suspend_count": smartguard_summary.get("suspend_count"),
+            "resume_count": smartguard_summary.get("resume_count"),
+            "any_activity": smartguard_summary.get("any_activity"),
         },
         "weather": {
             "weather_stress_score": metrics.get("weather_stress_score"),

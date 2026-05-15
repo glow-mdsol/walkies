@@ -106,6 +106,46 @@ body {
   font-weight: 600;
 }
 
+.analysis-tabs.home-tabs {
+  border-bottom: none;
+  background: linear-gradient(180deg, #f6fbf8 0%, #f3f8f5 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 0.3rem;
+  gap: 0.3rem;
+}
+
+.analysis-tabs .home-tab {
+  border-bottom: none;
+  margin-bottom: 0;
+  border-radius: calc(var(--radius) - 2px);
+  padding: 0.56rem 1.1rem;
+}
+
+.analysis-tabs .home-tab:hover {
+  background: #e9f4ed;
+}
+
+.analysis-tabs .home-tab--active {
+  background: linear-gradient(180deg, #ffffff 0%, #f7fbf8 100%);
+  border: 1px solid #b9d7c5;
+  color: #145a3a;
+  box-shadow: 0 1px 0 rgba(20, 90, 58, 0.1), 0 3px 8px rgba(20, 90, 58, 0.08);
+}
+
+@media (max-width: 620px) {
+  .analysis-tabs.home-tabs {
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .analysis-tabs .home-tab {
+    white-space: nowrap;
+    flex: 0 0 auto;
+  }
+}
+
 /* ── Cards ── */
 .card {
   background: var(--surface);
@@ -519,6 +559,77 @@ body {
   grid-column: 1 / -1;
   color: var(--text-muted);
   font-size: 0.78rem;
+}
+
+.insulin-marker-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem 1rem;
+  margin: 0.35rem 0 0.45rem;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+}
+
+.insulin-marker-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.insulin-marker-legend .marker {
+  width: 14px;
+  height: 0;
+  border-top: 2px solid;
+  display: inline-block;
+}
+
+.insulin-marker-legend .marker-predicted { border-top-color: #be2f2f; }
+.insulin-marker-legend .marker-suspend { border-top: 2px dashed #d16a00; }
+.insulin-marker-legend .marker-resume { border-top: 2px dashed #1f8a5b; }
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  display: grid;
+  place-items: center;
+  z-index: 1200;
+  padding: 1rem;
+}
+
+.modal-panel {
+  width: min(520px, 100%);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 1rem 1rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+}
+
+.modal-panel h3 {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.modal-copy {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.modal-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.4rem;
 }
 
 /* ── Route map ── */

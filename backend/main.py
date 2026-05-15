@@ -1,7 +1,10 @@
 import json
 import csv
+import hashlib
 import math
+import os
 import re
+import secrets
 import shutil
 import struct
 import urllib.parse
@@ -11,18 +14,26 @@ from pathlib import Path
 from typing import List, Optional
 import xml.etree.ElementTree as ET
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 
 from analytics import (
     ANALYTICS_VERSION,
+    create_share_link,
     delete_walk_analytics,
     get_cached_analytics_row,
+    get_share_link,
     init_analytics_db,
     list_all_analytics_rows,
     list_walk_analytics as list_cached_walk_analytics,
+    list_share_links_for_walk,
     persist_walk_analytics,
     refresh_walk_analytics_if_needed,
+    revoke_share_link,
 )
 
 app = FastAPI()
@@ -37,9 +48,61 @@ app.add_middleware(
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+DEV_BYPASS_AUTH = os.getenv("WALKIES_DEV_BYPASS_AUTH", "").strip() == "1"
+AUTH_SCHEME = HTTPBearer(auto_error=False)
+
 FIT_EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
 BG_CONTEXT_WINDOW = timedelta(minutes=30)
 init_analytics_db()
+
+
+def _safe_user_token(user_sub: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9_-]+', '-', user_sub).strip('-') or 'user'
+
+
+def _user_data_dir(user_sub: str) -> Path:
+    user_dir = DATA_DIR / _safe_user_token(user_sub)
+    user_dir.mkdir(exist_ok=True)
+    return user_dir
+
+
+def _auth_error(detail: str = "Authentication required") -> HTTPException:
+    return HTTPException(status_code=401, detail=detail)
+
+
+def _require_user(credentials: HTTPAuthorizationCredentials = Depends(AUTH_SCHEME)) -> dict:
+    if DEV_BYPASS_AUTH:
+        return {
+            "sub": "dev-user",
+            "email": "dev-user@local",
+            "name": "Dev User",
+        }
+
+    if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
+        raise _auth_error()
+
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured")
+
+    try:
+        info = id_token.verify_oauth2_token(
+            credentials.credentials,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except Exception:
+        raise _auth_error("Invalid Google token")
+
+    user_sub = str(info.get("sub") or "").strip()
+    if not user_sub:
+        raise _auth_error("Token missing subject")
+
+    return {
+        "sub": user_sub,
+        "email": info.get("email"),
+        "name": info.get("name"),
+    }
 
 
 def _parse_date(date_str: str) -> str:
@@ -55,13 +118,16 @@ def _slugify(text: str) -> str:
     return slug or 'walk'
 
 
-def _walk_date_for_dir(walk_dir: Path) -> str:
-    return walk_dir.parent.name if walk_dir.parent != DATA_DIR else walk_dir.name
+def _walk_date_for_dir(walk_dir: Path, data_root: Path = DATA_DIR) -> str:
+    return walk_dir.parent.name if walk_dir.parent != data_root else walk_dir.name
 
 
-def _iter_walk_dirs() -> list[Path]:
+def _iter_walk_dirs(data_root: Path = DATA_DIR) -> list[Path]:
     walk_dirs: list[Path] = []
-    for date_dir in sorted(DATA_DIR.iterdir(), reverse=True):
+    if not data_root.exists():
+        return walk_dirs
+
+    for date_dir in sorted(data_root.iterdir(), reverse=True):
         if not date_dir.is_dir():
             continue
         child_dirs = sorted((child for child in date_dir.iterdir() if child.is_dir()), reverse=True)
@@ -72,8 +138,8 @@ def _iter_walk_dirs() -> list[Path]:
     return walk_dirs
 
 
-def _find_walk_dir(walk_id: str) -> Path | None:
-    for walk_dir in _iter_walk_dirs():
+def _find_walk_dir(walk_id: str, data_root: Path = DATA_DIR) -> Path | None:
+    for walk_dir in _iter_walk_dirs(data_root):
         if walk_dir.name == walk_id:
             return walk_dir
     return None
@@ -107,7 +173,11 @@ def _backfill_walk_meta(walk_dir: Path, meta: dict) -> dict:
 
 
 def _load_walk_meta(walk_dir: Path) -> dict:
-    date = _walk_date_for_dir(walk_dir)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", walk_dir.parent.name or ""):
+        data_root = walk_dir.parent.parent
+    else:
+        data_root = walk_dir.parent
+    date = _walk_date_for_dir(walk_dir, data_root)
     meta_file = walk_dir / "meta.json"
     meta: dict = {}
     if meta_file.exists():
@@ -129,9 +199,13 @@ def _load_walk_meta(walk_dir: Path) -> dict:
     }
 
 
-def _make_walk_id(date: str, fit_start_dt: datetime | None, name: str, date_dir: Path) -> str:
+def _make_walk_id(date: str, fit_start_dt: datetime | None, name: str, date_dir: Path, user_sub: str | None = None) -> str:
     time_part = (fit_start_dt or datetime.now(timezone.utc)).strftime("%H%M%S")
-    base = f"{date}-{time_part}-{_slugify(name)}"
+    user_tag = ''
+    if user_sub:
+        safe = _safe_user_token(user_sub)
+        user_tag = f"-{safe[:6]}" if safe else ''
+    base = f"{date}-{time_part}-{_slugify(name)}{user_tag}"
     candidate = base
     suffix = 2
     while (date_dir / candidate).exists():
@@ -566,6 +640,7 @@ def _parse_carelink_csv(csv_path: Path) -> dict:
     bg_points = []
     basal_points = []
     bolus_events = []
+    smartguard_events = []
 
     for ts, row, indexes in rows:
         iso = ts.isoformat()
@@ -588,13 +663,70 @@ def _parse_carelink_csv(csv_path: Path) -> dict:
         if bolus_units is not None and bolus_units > 0:
             bolus_events.append({'timestamp': iso, 'units': bolus_units})
 
+        suspend_col = indexes.get('Suspend')
+        suspend_value = row[suspend_col].strip() if suspend_col is not None and suspend_col < len(row) and row[suspend_col] else ''
+        if suspend_value:
+            upper = suspend_value.upper()
+            if upper == 'NORMAL_PUMPING':
+                state = 'resume'
+            elif 'PLGM_PREDICTED_LOW_SG' in upper or 'PREDICTED_LOW' in upper:
+                state = 'predicted_low_suspend'
+            elif 'SUSPEND' in upper:
+                state = 'suspend'
+            else:
+                state = 'other'
+            smartguard_events.append({'timestamp': iso, 'raw_state': suspend_value, 'state': state})
+
     bg_points.sort(key=lambda x: x['timestamp'])
     basal_points.sort(key=lambda x: x['timestamp'])
     bolus_events.sort(key=lambda x: x['timestamp'])
+    smartguard_events.sort(key=lambda x: x['timestamp'])
 
-    # Keep unfiltered basal samples so we can carry the last known rate into chart start.
-    basal_points_all = list(basal_points)
-    return {'bg': bg_points, 'basal': basal_points, 'bolus': bolus_events}
+    return {'bg': bg_points, 'basal': basal_points, 'bolus': bolus_events, 'smartguard': smartguard_events}
+
+
+def _smartguard_summary(activity_points: list[dict], smartguard_events: list[dict]) -> dict:
+    if not activity_points:
+        return {
+            'event_count': 0,
+            'predicted_low_suspend_count': 0,
+            'suspend_count': 0,
+            'resume_count': 0,
+            'any_activity': False,
+        }
+
+    walk_start = datetime.fromisoformat(activity_points[0]['timestamp_iso'])
+    walk_end = datetime.fromisoformat(activity_points[-1]['timestamp_iso'])
+
+    event_count = 0
+    predicted_low_suspend_count = 0
+    suspend_count = 0
+    resume_count = 0
+
+    for event in smartguard_events:
+        try:
+            ts = datetime.fromisoformat(event['timestamp'])
+        except (KeyError, ValueError):
+            continue
+        if ts < walk_start or ts > walk_end:
+            continue
+
+        event_count += 1
+        state = event.get('state')
+        if state == 'predicted_low_suspend':
+            predicted_low_suspend_count += 1
+        elif state == 'suspend':
+            suspend_count += 1
+        elif state == 'resume':
+            resume_count += 1
+
+    return {
+        'event_count': event_count,
+        'predicted_low_suspend_count': predicted_low_suspend_count,
+        'suspend_count': suspend_count,
+        'resume_count': resume_count,
+        'any_activity': event_count > 0,
+    }
 
 
 def _carelink_time_bounds(csv_path: Path) -> tuple[datetime | None, datetime | None]:
@@ -625,11 +757,15 @@ def _carelink_time_bounds(csv_path: Path) -> tuple[datetime | None, datetime | N
         return None, None
 
 
-def _find_reusable_carelink_csv(activity_start_dt: datetime | None, activity_end_dt: datetime | None) -> tuple[Path, dict] | None:
+def _find_reusable_carelink_csv(
+    activity_start_dt: datetime | None,
+    activity_end_dt: datetime | None,
+    data_root: Path = DATA_DIR,
+) -> tuple[Path, dict] | None:
     if activity_start_dt is None or activity_end_dt is None:
         return None
 
-    for walk_dir in _iter_walk_dirs():
+    for walk_dir in _iter_walk_dirs(data_root):
         meta = _load_walk_meta(walk_dir)
         coverage_start = _parse_carelink_datetime(meta.get('carelink_start_time'))
         coverage_end = _parse_carelink_datetime(meta.get('carelink_end_time'))
@@ -1474,6 +1610,194 @@ def _stress_decoupling_analytics(activity_points: list[dict], weather_points: li
     }
 
 
+def _insulin_stress_effect_analytics(
+    activity_points: list[dict],
+    bolus_events_all: list[dict],
+    weather_points: list[dict],
+) -> dict:
+    """
+    Heuristic proxy for exercise-related insulin potentiation during active bolus windows.
+    Non-diagnostic and intended for trend tracking only.
+    """
+    if len(activity_points) < 3:
+        return {
+            'series': [],
+            'summary': {
+                'stress_multiplier': None,
+                'band': None,
+                'overlap_minutes': None,
+                'weighted_overlap_minutes': None,
+                'peak_iob_units_proxy': None,
+                'peak_stress_index': None,
+            },
+            'defaults': {
+                'iob_window_minutes': 240,
+                'max_hr_reference': 175,
+            },
+        }
+
+    weather_pairs: list[tuple[float, dict]] = []
+    for row in weather_points:
+        try:
+            ts = datetime.fromisoformat(row['timestamp']).timestamp()
+        except (KeyError, ValueError):
+            continue
+        weather_pairs.append((ts, row))
+    weather_pairs.sort(key=lambda x: x[0])
+
+    bolus_rows: list[tuple[float, float]] = []
+    for row in bolus_events_all:
+        try:
+            ts = datetime.fromisoformat(row['timestamp']).timestamp()
+            units = float(row['units'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if units > 0:
+            bolus_rows.append((ts, units))
+    bolus_rows.sort(key=lambda x: x[0])
+
+    if not bolus_rows:
+        return {
+            'series': [],
+            'summary': {
+                'stress_multiplier': None,
+                'band': None,
+                'overlap_minutes': 0.0,
+                'weighted_overlap_minutes': 0.0,
+                'peak_iob_units_proxy': 0.0,
+                'peak_stress_index': None,
+            },
+            'defaults': {
+                'iob_window_minutes': 240,
+                'max_hr_reference': 175,
+            },
+        }
+
+    iob_window_s = 4.0 * 3600.0
+    max_hr_reference = 175.0
+    series: list[dict] = []
+    weighted_overlap_minutes = 0.0
+    overlap_minutes = 0.0
+
+    peak_iob_units_proxy = 0.0
+    peak_stress_index = 0.0
+    weighted_stress_sum = 0.0
+    weighted_base_sum = 0.0
+
+    for i in range(1, len(activity_points)):
+        prev = activity_points[i - 1]
+        curr = activity_points[i]
+
+        if prev.get('timestamp') is None or curr.get('timestamp') is None:
+            continue
+        if curr.get('hr') is None:
+            continue
+
+        dt_s = float(curr['timestamp']) - float(prev['timestamp'])
+        if dt_s <= 0 or dt_s > 180:
+            continue
+        dt_min = dt_s / 60.0
+
+        dist_m = None
+        if prev.get('distance_m') is not None and curr.get('distance_m') is not None:
+            delta_m = float(curr['distance_m']) - float(prev['distance_m'])
+            if delta_m > 0:
+                dist_m = delta_m
+        if dist_m is None and prev.get('lat') is not None and prev.get('lon') is not None and curr.get('lat') is not None and curr.get('lon') is not None:
+            dist_m = _haversine_km(float(prev['lat']), float(prev['lon']), float(curr['lat']), float(curr['lon'])) * 1000.0
+        if dist_m is None or dist_m <= 0:
+            continue
+
+        grade_pct = 0.0
+        if prev.get('altitude_m') is not None and curr.get('altitude_m') is not None and dist_m >= 20.0:
+            grade_pct = ((float(curr['altitude_m']) - float(prev['altitude_m'])) / dist_m) * 100.0
+
+        mid_ts = (float(prev['timestamp']) + float(curr['timestamp'])) / 2.0
+
+        iob_units_proxy = 0.0
+        for bolus_ts, bolus_units in bolus_rows:
+            elapsed = mid_ts - bolus_ts
+            if elapsed < 0 or elapsed > iob_window_s:
+                continue
+            remaining = 1.0 - (elapsed / iob_window_s)
+            iob_units_proxy += bolus_units * max(remaining, 0.0)
+
+        if iob_units_proxy < 0.05:
+            continue
+
+        hr = float(curr['hr'])
+        hr_load = max(min((hr - 95.0) / (max_hr_reference - 95.0), 1.4), 0.0)
+        uphill_load = max(min(grade_pct / 8.0, 1.0), 0.0)
+
+        wx = _weather_interp(mid_ts, weather_pairs) if weather_pairs else None
+        apparent_c = float(wx['apparent_c']) if wx and wx.get('apparent_c') is not None else None
+        heat_load = max(min(((apparent_c or 18.0) - 18.0) / 10.0, 1.0), 0.0)
+
+        stress_index = 1.0 + (0.45 * hr_load) + (0.20 * uphill_load) + (0.10 * heat_load)
+        stress_index = max(0.8, min(1.9, stress_index))
+
+        # Saturate at 3 U to prevent a single large bolus dominating the score.
+        iob_weight = min(iob_units_proxy / 3.0, 1.0)
+        overlap_minutes += dt_min
+        weighted_overlap_minutes += dt_min * iob_weight
+        weighted_stress_sum += dt_min * iob_weight * stress_index
+        weighted_base_sum += dt_min * iob_weight
+
+        peak_iob_units_proxy = max(peak_iob_units_proxy, iob_units_proxy)
+        peak_stress_index = max(peak_stress_index, stress_index)
+
+        series.append({
+            'timestamp': curr['timestamp_iso'],
+            'distance_km': (float(curr['distance_m']) / 1000.0) if curr.get('distance_m') is not None else None,
+            'iob_units_proxy': iob_units_proxy,
+            'stress_index': stress_index,
+            'insulin_effect_index': stress_index * iob_weight,
+        })
+
+    if weighted_base_sum <= 0:
+        return {
+            'series': [row for row in series if row.get('distance_km') is not None],
+            'summary': {
+                'stress_multiplier': None,
+                'band': None,
+                'overlap_minutes': overlap_minutes,
+                'weighted_overlap_minutes': weighted_overlap_minutes,
+                'peak_iob_units_proxy': peak_iob_units_proxy,
+                'peak_stress_index': peak_stress_index if peak_stress_index > 0 else None,
+            },
+            'defaults': {
+                'iob_window_minutes': 240,
+                'max_hr_reference': 175,
+            },
+        }
+
+    multiplier = weighted_stress_sum / weighted_base_sum
+    if multiplier < 1.10:
+        band = 'Low'
+    elif multiplier < 1.25:
+        band = 'Moderate'
+    elif multiplier < 1.40:
+        band = 'High'
+    else:
+        band = 'Very High'
+
+    return {
+        'series': [row for row in series if row.get('distance_km') is not None],
+        'summary': {
+            'stress_multiplier': multiplier,
+            'band': band,
+            'overlap_minutes': overlap_minutes,
+            'weighted_overlap_minutes': weighted_overlap_minutes,
+            'peak_iob_units_proxy': peak_iob_units_proxy,
+            'peak_stress_index': peak_stress_index,
+        },
+        'defaults': {
+            'iob_window_minutes': 240,
+            'max_hr_reference': 175,
+        },
+    }
+
+
 def _stress_summary_for_walk_dir(walk_dir: Path) -> dict | None:
     fit_files = sorted(walk_dir.glob('*.fit'))
     if not fit_files:
@@ -1512,8 +1836,36 @@ def _fmt(value: float | None, digits: int = 2, suffix: str = '') -> str:
     return f'{value:.{digits}f}{suffix}'
 
 
+def _etag_for_payload(payload: dict) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_headers(*, public: bool) -> dict[str, str]:
+    if public:
+        return {
+            "Cache-Control": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400",
+        }
+    return {
+        "Cache-Control": "private, max-age=0, must-revalidate",
+    }
+
+
+def _json_with_cache(payload: dict, request: Request, *, public: bool) -> Response:
+    etag = _etag_for_payload(payload)
+    request_etag = request.headers.get("if-none-match", "").strip().strip('"')
+    headers = {
+        **_cache_headers(public=public),
+        "ETag": f'"{etag}"',
+    }
+    if request_etag and request_etag == etag:
+        return Response(status_code=304, headers=headers)
+    return JSONResponse(content=payload, headers=headers)
+
+
 @app.post("/api/walks/parse-fit-date")
-async def parse_fit_date(file: UploadFile = File(...)):
+async def parse_fit_date(file: UploadFile = File(...), user: dict = Depends(_require_user)):
+    _ = user
     data = await file.read()
     date_str = _fit_start_date(data)
     if not date_str:
@@ -1521,23 +1873,28 @@ async def parse_fit_date(file: UploadFile = File(...)):
     return {"date": date_str}
 
 
-def _prefetch_analytics_background(walk_ids: list[str]) -> None:
+def _prefetch_analytics_background(walk_ids: list[str], data_root: Path) -> None:
     for walk_id in walk_ids:
         try:
             refresh_walk_analytics_if_needed(
                 walk_id,
-                find_walk_dir=_find_walk_dir,
-                get_walk_analysis_data=_get_walk_analysis_data,
+                find_walk_dir=lambda wid: _find_walk_dir(wid, data_root),
+                get_walk_analysis_data=lambda wid, persist_analytics=False: _get_walk_analysis_data(
+                    wid,
+                    persist_analytics=persist_analytics,
+                    data_root=data_root,
+                ),
             )
         except Exception:
             pass
 
 
 @app.get("/api/walks")
-def list_walks(background_tasks: BackgroundTasks):
+def list_walks(background_tasks: BackgroundTasks, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
     walks = []
     uncached_ids: list[str] = []
-    for walk_dir in _iter_walk_dirs():
+    for walk_dir in _iter_walk_dirs(data_root):
         meta = _load_walk_meta(walk_dir)
         cached = get_cached_analytics_row(meta["id"])
         needs_prefetch = (
@@ -1557,7 +1914,7 @@ def list_walks(background_tasks: BackgroundTasks):
             meta["metrics"] = None
         walks.append(meta)
     if uncached_ids:
-        background_tasks.add_task(_prefetch_analytics_background, uncached_ids)
+            background_tasks.add_task(_prefetch_analytics_background, uncached_ids, data_root)
     walks.sort(key=lambda walk: (walk.get("start_time") or "", walk["date"], walk["id"]), reverse=True)
     return walks
 
@@ -1567,9 +1924,11 @@ async def upload_files(
     date: str = Form(...),
     name: Optional[str] = Form(""),
     files: List[UploadFile] = File(...),
+    user: dict = Depends(_require_user),
 ):
     date = _parse_date(date)
-    date_dir = DATA_DIR / date
+    data_root = _user_data_dir(user['sub'])
+    date_dir = data_root / date
     date_dir.mkdir(exist_ok=True)
 
     prepared_files: list[tuple[str, bytes]] = []
@@ -1590,7 +1949,7 @@ async def upload_files(
             has_uploaded_carelink_csv = True
 
     if fit_identity is not None:
-        for existing_walk_dir in _iter_walk_dirs():
+        for existing_walk_dir in _iter_walk_dirs(data_root):
             existing_meta = _load_walk_meta(existing_walk_dir)
             existing_fit_identity = existing_meta.get("fit_identity")
             if existing_fit_identity is None:
@@ -1606,7 +1965,7 @@ async def upload_files(
 
     reused_carelink: tuple[Path, dict] | None = None
     if not has_uploaded_carelink_csv:
-        reused_carelink = _find_reusable_carelink_csv(fit_start_dt, fit_end_dt)
+        reused_carelink = _find_reusable_carelink_csv(fit_start_dt, fit_end_dt, data_root=data_root)
         if reused_carelink is None:
             raise HTTPException(
                 status_code=400,
@@ -1614,7 +1973,7 @@ async def upload_files(
             )
 
     walk_name = (name or "").strip()
-    walk_id = _make_walk_id(date, fit_start_dt, walk_name, date_dir)
+    walk_id = _make_walk_id(date, fit_start_dt, walk_name, date_dir, user_sub=user['sub'])
     walk_dir = date_dir / walk_id
     walk_dir.mkdir(exist_ok=False)
 
@@ -1649,8 +2008,9 @@ async def upload_files(
 
 
 @app.delete("/api/walks/{walk_id}")
-def delete_walk(walk_id: str):
-    walk_dir = _find_walk_dir(walk_id)
+def delete_walk(walk_id: str, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    walk_dir = _find_walk_dir(walk_id, data_root)
     if walk_dir is None or not walk_dir.exists():
         raise HTTPException(status_code=404, detail="Walk not found")
     shutil.rmtree(walk_dir)
@@ -1661,8 +2021,12 @@ def delete_walk(walk_id: str):
     return {"deleted": walk_id}
 
 
-def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tuple[str, str | None, dict, dict]:
-    walk_dir = _find_walk_dir(walk_id)
+def _get_walk_analysis_data(
+    walk_id: str,
+    persist_analytics: bool = False,
+    data_root: Path = DATA_DIR,
+) -> tuple[str, str | None, dict, dict]:
+    walk_dir = _find_walk_dir(walk_id, data_root)
     if walk_dir is None or not walk_dir.exists() or not walk_dir.is_dir():
         raise HTTPException(status_code=404, detail='Walk not found')
 
@@ -1723,15 +2087,19 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
     bg_points: list[dict] = []
     basal_points: list[dict] = []
     bolus_events: list[dict] = []
+    smartguard_events: list[dict] = []
     for csv_path in csv_files:
         parsed = _parse_carelink_csv(csv_path)
         bg_points.extend(parsed['bg'])
         basal_points.extend(parsed['basal'])
         bolus_events.extend(parsed['bolus'])
+        smartguard_events.extend(parsed.get('smartguard', []))
 
     bg_points.sort(key=lambda x: x['timestamp'])
     basal_points.sort(key=lambda x: x['timestamp'])
     bolus_events.sort(key=lambda x: x['timestamp'])
+    smartguard_events.sort(key=lambda x: x['timestamp'])
+    bolus_events_all = list(bolus_events)
 
     # Keep unfiltered basal samples so we can carry the last known rate into chart start.
     basal_points_all = list(basal_points)
@@ -1739,6 +2107,7 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
     bg_points = _window_filter(bg_points, start_dt, end_dt, 'timestamp')
     basal_points = _window_filter(basal_points, start_dt, end_dt, 'timestamp')
     bolus_events = _window_filter(bolus_events, start_dt, end_dt, 'timestamp')
+    smartguard_events = _window_filter(smartguard_events, start_dt, end_dt, 'timestamp')
 
     # Build (posix_ts, distance_km) lookup for interpolation
     dist_pairs: list[tuple[float, float]] = [
@@ -1836,6 +2205,10 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
     for pt in bolus_events:
         pt['distance_km'] = _ts_to_dist_km(datetime.fromisoformat(pt['timestamp']).timestamp(), dist_pairs)
 
+    for pt in smartguard_events:
+        point_ts = datetime.fromisoformat(pt['timestamp']).timestamp()
+        pt['distance_km'] = _ts_to_chart_dist(point_ts)
+
     # Time markers: every 30 min from walk start
     time_markers: list[dict] = []
     map_hour_markers: list[dict] = []
@@ -1872,12 +2245,39 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
             })
             t += 3600
 
-    if fit_track:
-        map_track = fit_track
-    elif gpx_files:
-        map_track = _parse_gpx_track(gpx_files[0])
-    else:
-        map_track = []
+    bg_pairs_for_map: list[tuple[float, float]] = []
+    for point in bg_points:
+        try:
+            ts_unix = datetime.fromisoformat(point['timestamp']).timestamp()
+            bg_val = float(point['bg'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        bg_pairs_for_map.append((ts_unix, bg_val))
+    bg_pairs_for_map.sort(key=lambda x: x[0])
+
+    map_track: list[list[float | None]] = []
+    for point in activity_points:
+        if point.get('lat') is None or point.get('lon') is None:
+            continue
+        try:
+            point_ts = datetime.fromisoformat(point['timestamp_iso']).timestamp()
+        except (KeyError, ValueError):
+            point_ts = None
+        bg_val = _interp_bg(point_ts, bg_pairs_for_map) if point_ts is not None and bg_pairs_for_map else None
+        map_track.append([
+            point['lat'],
+            point['lon'],
+            point.get('hr'),
+            bg_val,
+        ])
+
+    if not map_track:
+        if fit_track:
+            map_track = fit_track
+        elif gpx_files:
+            map_track = _parse_gpx_track(gpx_files[0])
+        else:
+            map_track = []
 
     weather_points: list[dict] = []
     if activity_points and dist_pairs:
@@ -1913,8 +2313,10 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
                 })
 
     metrics = _summary_metrics(activity_points, bg_points, bolus_events)
+    smartguard_summary = _smartguard_summary(activity_points, smartguard_events)
     weather_effort = _weather_effort_analytics(activity_points, weather_points, metrics.get('duration_h'))
     stress_analytics = _stress_decoupling_analytics(activity_points, weather_points)
+    insulin_stress_effect = _insulin_stress_effect_analytics(activity_points, bolus_events_all, weather_points)
 
     trend_rows: list[dict] = []
     current_summary = stress_analytics.get('summary') or {}
@@ -1930,7 +2332,7 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
             'distance_km': metrics.get('distance_km'),
         })
 
-    for other_walk_dir in _iter_walk_dirs():
+    for other_walk_dir in _iter_walk_dirs(data_root):
         if other_walk_dir == walk_dir:
             continue
         other_summary = _stress_summary_for_walk_dir(other_walk_dir)
@@ -1946,10 +2348,15 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
         'bolus': bolus_events,
         'phaseAnalytics': _phase_glucose_analytics(activity_points, bg_points),
         'intensityAnalytics': _intensity_glucose_analytics(activity_points, bg_points),
+        'smartguard': {
+            'events': smartguard_events,
+            'summary': smartguard_summary,
+        },
         'weather': weather_points,
         'windProfile': weather_effort['wind_profile'],
         'windRose': weather_effort['wind_rose'],
         'stressAnalytics': stress_analytics,
+        'insulinStressEffect': insulin_stress_effect,
         'stressTrend': trend_rows,
         'mapTrack': map_track,
         'mapHourMarkers': map_hour_markers,
@@ -1970,6 +2377,15 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
         'hr_decoupling_score': stress_analytics['summary'].get('score'),
         'hr_decoupling_band': stress_analytics['summary'].get('band'),
         'hr_elevated_minutes': stress_analytics['summary'].get('elevated_minutes'),
+        'insulin_stress_multiplier': insulin_stress_effect['summary'].get('stress_multiplier'),
+        'insulin_stress_band': insulin_stress_effect['summary'].get('band'),
+        'insulin_iob_overlap_minutes': insulin_stress_effect['summary'].get('overlap_minutes'),
+        'insulin_iob_weighted_overlap_minutes': insulin_stress_effect['summary'].get('weighted_overlap_minutes'),
+        'smartguard_event_count': smartguard_summary.get('event_count'),
+        'smartguard_predicted_low_suspend_count': smartguard_summary.get('predicted_low_suspend_count'),
+        'smartguard_suspend_count': smartguard_summary.get('suspend_count'),
+        'smartguard_resume_count': smartguard_summary.get('resume_count'),
+        'smartguard_active': smartguard_summary.get('any_activity'),
     })
 
     route_fingerprint = _compute_route_fingerprint(map_track, metrics.get("distance_km"))
@@ -1987,33 +2403,44 @@ def _get_walk_analysis_data(walk_id: str, persist_analytics: bool = False) -> tu
 
 
 @app.get('/api/analytics/walks')
-def list_walk_analytics():
+def list_walk_analytics(user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
     return list_cached_walk_analytics(
-        iter_walk_dirs=_iter_walk_dirs,
+        iter_walk_dirs=lambda: _iter_walk_dirs(data_root),
         load_walk_meta=_load_walk_meta,
     )
 
 
 @app.post('/api/analytics/{walk_id}/refresh')
-def refresh_walk_analytics(walk_id: str, force: bool = False):
+def refresh_walk_analytics(walk_id: str, force: bool = False, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
     return refresh_walk_analytics_if_needed(
         walk_id,
         force=force,
-        find_walk_dir=_find_walk_dir,
-        get_walk_analysis_data=_get_walk_analysis_data,
+        find_walk_dir=lambda wid: _find_walk_dir(wid, data_root),
+        get_walk_analysis_data=lambda wid, persist_analytics=False: _get_walk_analysis_data(
+            wid,
+            persist_analytics=persist_analytics,
+            data_root=data_root,
+        ),
     )
 
 
 @app.post('/api/analytics/backfill')
-def backfill_walk_analytics(force: bool = False):
+def backfill_walk_analytics(force: bool = False, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
     results: list[dict] = []
-    for walk_dir in _iter_walk_dirs():
+    for walk_dir in _iter_walk_dirs(data_root):
         results.append(
             refresh_walk_analytics_if_needed(
                 walk_dir.name,
                 force=force,
-                find_walk_dir=_find_walk_dir,
-                get_walk_analysis_data=_get_walk_analysis_data,
+                find_walk_dir=lambda wid: _find_walk_dir(wid, data_root),
+                get_walk_analysis_data=lambda wid, persist_analytics=False: _get_walk_analysis_data(
+                    wid,
+                    persist_analytics=persist_analytics,
+                    data_root=data_root,
+                ),
             )
         )
     return {
@@ -2024,11 +2451,12 @@ def backfill_walk_analytics(force: bool = False):
 
 
 @app.get('/api/walks/{walk_id}/analysis-data')
-def walk_analysis_data(walk_id: str):
-    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True)
-    walk_dir = _find_walk_dir(walk_id)
+def walk_analysis_data(walk_id: str, request: Request, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
+    walk_dir = _find_walk_dir(walk_id, data_root)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
-    return {
+    result = {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
@@ -2036,19 +2464,98 @@ def walk_analysis_data(walk_id: str):
         'metrics': metrics,
         'files': files,
     }
+    return _json_with_cache(result, request, public=False)
 
 
 @app.get('/api/walks/{walk_id}/analysis')
-def walk_analysis(walk_id: str):
-    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True)
+def walk_analysis(walk_id: str, request: Request, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
     # Backward-compatible alias for clients that used /analysis.
-    return {
+    result = {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
         'payload': payload,
         'metrics': metrics,
     }
+    return _json_with_cache(result, request, public=False)
+
+
+@app.post('/api/walks/{walk_id}/share-links')
+def create_walk_share_link(walk_id: str, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    walk_dir = _find_walk_dir(walk_id, data_root)
+    if walk_dir is None:
+        raise HTTPException(status_code=404, detail='Walk not found')
+
+    token = secrets.token_urlsafe(18)
+    created_at = datetime.now(timezone.utc).isoformat()
+    create_share_link(token, user['sub'], walk_id, created_at)
+    return {
+        'token': token,
+        'walk_id': walk_id,
+        'created_at': created_at,
+        'share_path': f'/api/share/{token}/analysis-data',
+    }
+
+
+@app.get('/api/walks/{walk_id}/share-links')
+def list_walk_share_links(walk_id: str, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    walk_dir = _find_walk_dir(walk_id, data_root)
+    if walk_dir is None:
+        raise HTTPException(status_code=404, detail='Walk not found')
+    rows = list_share_links_for_walk(user['sub'], walk_id)
+    return {
+        'walk_id': walk_id,
+        'links': rows,
+    }
+
+
+@app.delete('/api/share-links/{token}')
+def revoke_walk_share_link(token: str, user: dict = Depends(_require_user)):
+    revoked = revoke_share_link(token, user['sub'], datetime.now(timezone.utc).isoformat())
+    if not revoked:
+        raise HTTPException(status_code=404, detail='Share link not found')
+    return {'revoked': token}
+
+
+@app.get('/api/share/{token}/analysis-data')
+def shared_walk_analysis_data(token: str, request: Request):
+    share = get_share_link(token)
+    if share is None:
+        raise HTTPException(status_code=404, detail='Share link not found')
+    if share.get('revoked_at'):
+        raise HTTPException(status_code=404, detail='Share link revoked')
+
+    expires_at = share.get('expires_at')
+    if expires_at:
+        try:
+            expiry_dt = datetime.fromisoformat(expires_at)
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > expiry_dt:
+                raise HTTPException(status_code=404, detail='Share link expired')
+        except ValueError:
+            raise HTTPException(status_code=500, detail='Invalid share link expiry')
+
+    owner_sub = share['owner_sub']
+    walk_id = share['walk_id']
+    data_root = _user_data_dir(owner_sub)
+    date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
+    walk_dir = _find_walk_dir(walk_id, data_root)
+    files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
+    result = {
+        'walk_id': walk_id,
+        'date': date,
+        'name': walk_name,
+        'payload': payload,
+        'metrics': metrics,
+        'files': files,
+        'shared': True,
+    }
+    return _json_with_cache(result, request, public=True)
 
 
 def _walk_summary_row(r: dict) -> dict:
@@ -2069,8 +2576,10 @@ def _walk_summary_row(r: dict) -> dict:
 
 
 @app.get('/api/analytics/routes')
-def list_route_groups():
-    rows = [r for r in list_all_analytics_rows() if r.get('route_fingerprint')]
+def list_route_groups(user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    own_ids = {walk_dir.name for walk_dir in _iter_walk_dirs(data_root)}
+    rows = [r for r in list_all_analytics_rows() if r.get('route_fingerprint') and r.get('walk_id') in own_ids]
     groups = _build_route_groups(rows)
     result = []
     for group_walks in groups:
@@ -2091,8 +2600,10 @@ def list_route_groups():
 
 
 @app.get('/api/analytics/routes/{group_id}/compare')
-def route_compare(group_id: str):
-    rows = [r for r in list_all_analytics_rows() if r.get('route_fingerprint')]
+def route_compare(group_id: str, user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    own_ids = {walk_dir.name for walk_dir in _iter_walk_dirs(data_root)}
+    rows = [r for r in list_all_analytics_rows() if r.get('route_fingerprint') and r.get('walk_id') in own_ids]
     groups = _build_route_groups(rows)
     group_walks = next((g for g in groups if g[0]['walk_id'] == group_id), None)
     if group_walks is None:

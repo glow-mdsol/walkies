@@ -25,12 +25,12 @@ function MetricPill({ label, value }) {
   )
 }
 
-function WalkCard({ walk, onDeleted, onView }) {
+function WalkCard({ walk, onDeleted, onView, apiFetch }) {
   const m = walk.metrics
 
   const handleDelete = async () => {
     if (!confirm(`Delete walk ${walk.name || walk.date} and all its files?`)) return
-    const res = await fetch(`/api/walks/${encodeURIComponent(walk.id)}`, { method: 'DELETE' })
+    const res = await apiFetch(`/api/walks/${encodeURIComponent(walk.id)}`, { method: 'DELETE' })
     if (res.ok) onDeleted()
   }
 
@@ -61,7 +61,7 @@ function WalkCard({ walk, onDeleted, onView }) {
   )
 }
 
-export default function WalkList({ walks, onDeleted, onView }) {
+export default function WalkList({ walks, onDeleted, onView, apiFetch }) {
   if (!walks.length) {
     return <p className="empty">No walks yet — upload some files above.</p>
   }
@@ -69,7 +69,7 @@ export default function WalkList({ walks, onDeleted, onView }) {
   return (
     <section className="walk-list">
       {walks.map(w => (
-        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} onView={onView} />
+        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} onView={onView} apiFetch={apiFetch} />
       ))}
     </section>
   )

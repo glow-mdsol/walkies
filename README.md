@@ -150,6 +150,75 @@ This starts:
 
 Open `http://localhost:5173` in your browser. The Vite dev proxy forwards `/api` to the backend, so no CORS configuration is needed.
 
+### Docker
+
+If you want to run Walkies in containers, set the Google OAuth client ID in the project root `.env` file:
+
+```bash
+GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
+VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
+WALKIES_DEV_BYPASS_AUTH=0
+```
+
+Then start the compose stack:
+
+```bash
+task docker:up
+# or: docker compose up --build
+```
+
+That starts:
+
+- backend FastAPI on the internal Docker network
+- frontend served by Nginx on `http://localhost:5173`
+- Postgres 16 for analytics metadata
+
+The compose stack keeps uploaded walk files and the Postgres data directory in Docker volumes. If you want to override the database connection, set `ANALYTICS_DB_URL` in `.env` before starting the stack.
+
+### Authentication Configuration
+
+Walkies now uses Google sign-in and backend token verification.
+
+Frontend (`frontend/.env.local`):
+
+```bash
+VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
+```
+
+Backend (`backend/.env` or process env):
+
+```bash
+GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
+```
+
+Analytics DB backend (optional, defaults to local sqlite file):
+
+```bash
+# Default behavior (implicit)
+ANALYTICS_DB_URL=sqlite:///./backend/analytics.sqlite3
+
+# PostgreSQL
+ANALYTICS_DB_URL=postgresql://user:password@host:5432/walkies
+```
+
+To migrate existing analytics and share-link metadata from the legacy local sqlite file into the configured backend:
+
+```bash
+task analytics:migrate
+```
+
+Typical rollout flow:
+
+1. Set `ANALYTICS_DB_URL` to the target Postgres instance.
+2. Run `task analytics:migrate` once.
+3. Start the backend against the new database.
+
+Optional dev-only bypass (never enable in production):
+
+```bash
+WALKIES_DEV_BYPASS_AUTH=1
+```
+
 ## Available Tasks
 
 ```bash

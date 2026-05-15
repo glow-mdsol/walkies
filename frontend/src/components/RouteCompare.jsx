@@ -211,7 +211,7 @@ function RouteGroupList({ groups, computing, onSelect, onCompute }) {
   )
 }
 
-export default function RouteCompare({ onSelectWalk }) {
+export default function RouteCompare({ onSelectWalk, apiFetch }) {
   const [groups, setGroups] = useState(null)
   const [selectedGroupId, setSelectedGroupId] = useState(null)
   const [compareData, setCompareData] = useState(null)
@@ -220,19 +220,19 @@ export default function RouteCompare({ onSelectWalk }) {
   const [error, setError] = useState(null)
 
   function loadGroups() {
-    return fetch('/api/analytics/routes')
+    return apiFetch('/api/analytics/routes')
       .then(r => r.json())
       .then(setGroups)
       .catch(() => setError('Could not load route groups'))
   }
 
-  useEffect(() => { loadGroups() }, [])
+  useEffect(() => { loadGroups() }, [apiFetch])
 
   function selectGroup(groupId) {
     setSelectedGroupId(groupId)
     setCompareData(null)
     setLoading(true)
-    fetch(`/api/analytics/routes/${groupId}/compare`)
+    apiFetch(`/api/analytics/routes/${groupId}/compare`)
       .then(r => r.json())
       .then(d => { setCompareData(d); setLoading(false) })
       .catch(() => { setError('Could not load comparison data'); setLoading(false) })
@@ -240,7 +240,7 @@ export default function RouteCompare({ onSelectWalk }) {
 
   function handleCompute() {
     setComputing(true)
-    fetch('/api/analytics/backfill', { method: 'POST' })
+    apiFetch('/api/analytics/backfill', { method: 'POST' })
       .then(() => loadGroups())
       .finally(() => setComputing(false))
   }

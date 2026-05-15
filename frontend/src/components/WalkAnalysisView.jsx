@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { buildIobFn } from './InsulinSetup'
 import {
   ResponsiveContainer,
@@ -14,6 +14,7 @@ import {
   Bar,
   ComposedChart,
   Cell,
+  ReferenceLine,
 } from 'recharts'
 import {
   MapContainer,
@@ -159,12 +160,33 @@ function hrColor(hr) {
   return '#be2f2f'
 }
 
-function RouteMap({ track, hourMarkers }) {
+function bgColor(bg) {
+  if (bg == null || Number.isNaN(Number(bg))) return '#8b97a7'
+  const g = Number(bg)
+  if (g <= 3.9 || g >= 12.9) return '#be2f2f'
+  if (g >= 4.0 && g <= 8.0) return '#1f8a5b'
+  return '#d16a00'
+}
+
+function RouteMap({ track, hourMarkers, allowBgToggle = true, initialMode = 'hr', modeKey = 'default' }) {
+  const [mapColorMode, setMapColorMode] = useState(initialMode === 'bg' ? 'bg' : 'hr')
+  const effectiveMode = allowBgToggle ? mapColorMode : 'hr'
+
   const cleanTrack = useMemo(
     () => (track || [])
       .filter((p) => Array.isArray(p) && p.length >= 2 && p[0] != null && p[1] != null)
-      .map((p) => ({ lat: Number(p[0]), lon: Number(p[1]), hr: p[2] == null ? null : Number(p[2]) })),
+      .map((p) => ({
+        lat: Number(p[0]),
+        lon: Number(p[1]),
+        hr: p[2] == null ? null : Number(p[2]),
+        bg: p[3] == null ? null : Number(p[3]),
+      })),
     [track],
+  )
+
+  const hasBgData = useMemo(
+    () => cleanTrack.some((p) => p.bg != null && !Number.isNaN(p.bg)),
+    [cleanTrack],
   )
 
   const sampledTrack = useMemo(() => {
@@ -186,6 +208,7 @@ function RouteMap({ track, hourMarkers }) {
         [pt.lat, pt.lon],
       ],
       hr: pt.hr,
+      bg: pt.bg,
     })),
     [sampledTrack],
   )
@@ -206,6 +229,32 @@ function RouteMap({ track, hourMarkers }) {
 
   return (
     <div className="route-map-shell">
+      {allowBgToggle ? (
+        <div className="route-map-controls" style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '0.5rem' }}>
+          <>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+              <input
+                type="radio"
+                name={`map-color-mode-${modeKey}`}
+                value="hr"
+                checked={mapColorMode === 'hr'}
+                onChange={() => setMapColorMode('hr')}
+              />
+              HR colouring
+            </label>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: '0.35rem' }}>
+              <input
+                type="radio"
+                name={`map-color-mode-${modeKey}`}
+                value="bg"
+                checked={mapColorMode === 'bg'}
+                onChange={() => setMapColorMode('bg')}
+              />
+              BG colouring
+            </label>
+          </>
+        </div>
+      ) : null}
       <MapContainer
         className="route-map"
         bounds={latLngs}
@@ -220,7 +269,12 @@ function RouteMap({ track, hourMarkers }) {
           <Polyline
             key={`seg-${idx}`}
             positions={seg.coords}
-            pathOptions={{ color: hrColor(seg.hr), weight: 4, opacity: 0.9 }}
+            pathOptions={{
+              color: effectiveMode === 'bg' ? bgColor(seg.bg) : hrColor(seg.hr),
+              weight: 4,
+              opacity: 0.9,
+              dashArray: effectiveMode === 'bg' && seg.bg == null ? '6 6' : undefined,
+            }}
           />
         ))}
         {hourMarkerRows.map((m, idx) => (
@@ -236,10 +290,21 @@ function RouteMap({ track, hourMarkers }) {
         </CircleMarker>
       </MapContainer>
       <div className="route-legend">
-        <span><i style={{ background: '#2f6fb0' }} />Easy HR</span>
-        <span><i style={{ background: '#1f8a5b' }} />Steady HR</span>
-        <span><i style={{ background: '#d16a00' }} />Hard HR</span>
-        <span><i style={{ background: '#be2f2f' }} />Peak HR</span>
+        {effectiveMode === 'hr' ? (
+          <>
+            <span><i style={{ background: '#2f6fb0' }} />Easy HR</span>
+            <span><i style={{ background: '#1f8a5b' }} />Steady HR</span>
+            <span><i style={{ background: '#d16a00' }} />Hard HR</span>
+            <span><i style={{ background: '#be2f2f' }} />Peak HR</span>
+          </>
+        ) : (
+          <>
+            <span><i style={{ background: '#1f8a5b' }} />In range BG</span>
+            <span><i style={{ background: '#d16a00' }} />Mild deviation</span>
+            <span><i style={{ background: '#be2f2f' }} />Hypo/Hyper risk</span>
+            {!hasBgData ? <span><i style={{ background: '#8b97a7' }} />No BGM data trace</span> : null}
+          </>
+        )}
       </div>
     </div>
   )
@@ -258,6 +323,8 @@ const EFFORT_SCALE_MAX_DEFAULT = 1.8
 const EFFORT_SCALE_MAX_MIN = 1.1
 const EFFORT_SCALE_MAX_MAX = 2.5
 const ANALYTICS_PREFS_KEY = 'walkies.analyticsPrefs.v1'
+const INSULIN_MODEL_NORMAL = 'normal'
+const INSULIN_MODEL_SMARTGUARD = 'smartguard'
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value))
@@ -269,6 +336,7 @@ function loadAnalyticsPrefs() {
       effortHrReference: EFFORT_HR_REFERENCE_DEFAULT,
       effortScaleMin: EFFORT_SCALE_MIN_DEFAULT,
       effortScaleMax: EFFORT_SCALE_MAX_DEFAULT,
+      insulinModelMode: INSULIN_MODEL_NORMAL,
     }
   }
 
@@ -281,17 +349,19 @@ function loadAnalyticsPrefs() {
       effortHrReference: clamp(Number(parsed.effortHrReference) || EFFORT_HR_REFERENCE_DEFAULT, EFFORT_HR_REFERENCE_MIN, EFFORT_HR_REFERENCE_MAX),
       effortScaleMin: Math.min(effortScaleMin, effortScaleMax - 0.1),
       effortScaleMax: Math.max(effortScaleMax, effortScaleMin + 0.1),
+      insulinModelMode: parsed.insulinModelMode === INSULIN_MODEL_SMARTGUARD ? INSULIN_MODEL_SMARTGUARD : INSULIN_MODEL_NORMAL,
     }
   } catch {
     return {
       effortHrReference: EFFORT_HR_REFERENCE_DEFAULT,
       effortScaleMin: EFFORT_SCALE_MIN_DEFAULT,
       effortScaleMax: EFFORT_SCALE_MAX_DEFAULT,
+      insulinModelMode: INSULIN_MODEL_NORMAL,
     }
   }
 }
 
-export default function WalkAnalysisView({ walkId, insulinProfile }) {
+export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
   const initialPrefs = useMemo(() => loadAnalyticsPrefs(), [])
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -300,13 +370,33 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
   const [effortHrReference, setEffortHrReference] = useState(initialPrefs.effortHrReference)
   const [effortScaleMin, setEffortScaleMin] = useState(initialPrefs.effortScaleMin)
   const [effortScaleMax, setEffortScaleMax] = useState(initialPrefs.effortScaleMax)
+  const [analysisTab, setAnalysisTab] = useState('general')
+  const [insulinModelMode, setInsulinModelMode] = useState(initialPrefs.insulinModelMode)
+  const [showInsulinModelModal, setShowInsulinModelModal] = useState(false)
+  const [shareLinks, setShareLinks] = useState([])
+  const [shareBusy, setShareBusy] = useState(false)
+  const [shareMessage, setShareMessage] = useState(null)
+
+  const loadShareLinks = useCallback(() => {
+    if (!walkId) return
+    apiFetch(`/api/walks/${encodeURIComponent(walkId)}/share-links`)
+      .then(async (res) => {
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}))
+          throw new Error(payload.detail || 'Failed to load share links')
+        }
+        return res.json()
+      })
+      .then((payload) => setShareLinks(payload.links || []))
+      .catch(() => setShareLinks([]))
+  }, [walkId, apiFetch])
 
   useEffect(() => {
     if (!walkId) return
     setLoading(true)
     setError(null)
 
-    fetch(`/api/walks/${encodeURIComponent(walkId)}/analysis-data`)
+    apiFetch(`/api/walks/${encodeURIComponent(walkId)}/analysis-data`)
       .then(async (res) => {
         if (!res.ok) {
           const payload = await res.json().catch(() => ({}))
@@ -317,7 +407,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
       .then(setData)
       .catch((err) => setError(err.message || 'Failed to load walk analysis'))
       .finally(() => setLoading(false))
-  }, [walkId])
+  }, [walkId, apiFetch])
+
+  useEffect(() => {
+    loadShareLinks()
+  }, [loadShareLinks])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -325,12 +419,15 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
       effortHrReference,
       effortScaleMin,
       effortScaleMax,
+      insulinModelMode,
     }))
-  }, [effortHrReference, effortScaleMin, effortScaleMax])
+  }, [effortHrReference, effortScaleMin, effortScaleMax, insulinModelMode])
 
   const metrics = data?.metrics || {}
   const payload = data?.payload || {}
   const stressSummary = data?.payload?.stressAnalytics?.summary || {}
+  const insulinStressSummary = data?.payload?.insulinStressEffect?.summary || {}
+  const smartguardSummary = data?.payload?.smartguard?.summary || {}
   const trendRows = useMemo(() => (data?.payload?.stressTrend || []).slice(-8), [data])
 
   const activityRows = useMemo(
@@ -360,6 +457,18 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
   const stressRows = useMemo(
     () => (payload.stressAnalytics?.series || []).filter((r) => r.distance_km != null),
     [payload.stressAnalytics],
+  )
+  const smartguardRows = useMemo(
+    () => (payload.smartguard?.events || []).filter((r) => r.distance_km != null),
+    [payload.smartguard],
+  )
+  const smartguardMarkerRows = useMemo(
+    () => smartguardRows.filter((r) => r.distance_km != null),
+    [smartguardRows],
+  )
+  const predictedLowMarkerCount = useMemo(
+    () => smartguardMarkerRows.filter((r) => r.state === 'predicted_low_suspend').length,
+    [smartguardMarkerRows],
   )
   const mapTrack = payload.mapTrack || []
   const mapHourMarkers = payload.mapHourMarkers || []
@@ -409,6 +518,34 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
       .sort((a, b) => a.distance_km - b.distance_km)
   }, [activityRows, glucoseRows, basalRows, bolusRows])
 
+  const elevationHrBgChartRows = useMemo(() => {
+    const byDistance = new Map()
+
+    activityRows.forEach((row) => {
+      if (row.distance_km == null) return
+      byDistance.set(row.distance_km, {
+        distance_km: row.distance_km,
+        altitude_m: row.altitude_m ?? null,
+        hr: row.hr ?? null,
+        bg: null,
+      })
+    })
+
+    glucoseRows.forEach((row) => {
+      if (row.distance_km == null) return
+      const existing = byDistance.get(row.distance_km) || {
+        distance_km: row.distance_km,
+        altitude_m: null,
+        hr: null,
+        bg: null,
+      }
+      existing.bg = row.bg ?? null
+      byDistance.set(row.distance_km, existing)
+    })
+
+    return Array.from(byDistance.values()).sort((a, b) => a.distance_km - b.distance_km)
+  }, [activityRows, glucoseRows])
+
   const glucoseInsulinChartRows = useMemo(() => {
     if (!glucoseChartRows.length) return []
 
@@ -430,6 +567,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
     if (!bolusEvents.length) {
       return glucoseChartRows.map((row) => ({ ...row, bolus_decay: null }))
     }
+
+    const smartguardEvents = smartguardRows
+      .map((row) => ({ ts: Date.parse(row.timestamp || ''), state: row.state || 'other' }))
+      .filter((row) => Number.isFinite(row.ts))
+      .sort((a, b) => a.ts - b.ts)
 
     const effortScale = (hrValue) => {
       if (!Number.isFinite(hrValue)) return 1
@@ -486,6 +628,23 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
       return cumulativeEffortSeconds[lo] + (segDt * frac * segScale)
     }
 
+    const smartguardFactorAt = (ts) => {
+      if (insulinModelMode !== INSULIN_MODEL_SMARTGUARD || smartguardEvents.length === 0 || !Number.isFinite(ts)) {
+        return 1.0
+      }
+
+      let latestState = null
+      for (let i = 0; i < smartguardEvents.length; i += 1) {
+        if (smartguardEvents[i].ts > ts) break
+        latestState = smartguardEvents[i].state
+      }
+
+      if (latestState === 'predicted_low_suspend') return 0.20
+      if (latestState === 'suspend') return 0.35
+      if (latestState === 'resume') return 1.0
+      return 1.0
+    }
+
     return glucoseChartRows.map((row) => {
       const rowTs = Date.parse(row.timestamp || '')
       if (!Number.isFinite(rowTs)) return { ...row, bolus_decay: null }
@@ -502,12 +661,14 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
         activeUnits += event.units * iob(dtEffortSecs)
       }
 
+      activeUnits *= smartguardFactorAt(rowTs)
+
       return {
         ...row,
         bolus_decay: activeUnits > 0.01 ? Math.min(activeUnits, INSULIN_AXIS_MAX) : null,
       }
     })
-  }, [glucoseChartRows, bolusRows, insulinProfile, activityRows, effortHrReference, effortScaleMin, effortScaleMax])
+  }, [glucoseChartRows, bolusRows, insulinProfile, activityRows, effortHrReference, effortScaleMin, effortScaleMax, smartguardRows, insulinModelMode])
 
   const weatherChartRows = useMemo(() => {
     const byDistance = new Map()
@@ -635,6 +796,60 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
   const durStr = metrics.duration_h != null ? `${fmt(metrics.duration_h, 1)} h` : null
   const subtitleParts = [data.date, distStr, durStr].filter(Boolean)
 
+  const createShareLink = async () => {
+    if (!walkId) return
+    setShareBusy(true)
+    setShareMessage(null)
+    try {
+      const res = await apiFetch(`/api/walks/${encodeURIComponent(walkId)}/share-links`, { method: 'POST' })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(payload.detail || 'Failed to create share link')
+      const absolute = `${window.location.origin}${payload.share_path}`
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(absolute)
+        setShareMessage('Share link created and copied to clipboard.')
+      } else {
+        setShareMessage(`Share link created: ${absolute}`)
+      }
+      loadShareLinks()
+    } catch (err) {
+      setShareMessage(err.message || 'Failed to create share link')
+    } finally {
+      setShareBusy(false)
+    }
+  }
+
+  const revokeShareLink = async (token) => {
+    if (!token) return
+    setShareBusy(true)
+    setShareMessage(null)
+    try {
+      const res = await apiFetch(`/api/share-links/${encodeURIComponent(token)}`, { method: 'DELETE' })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(payload.detail || 'Failed to revoke share link')
+      setShareMessage('Share link revoked.')
+      loadShareLinks()
+    } catch (err) {
+      setShareMessage(err.message || 'Failed to revoke share link')
+    } finally {
+      setShareBusy(false)
+    }
+  }
+
+  const copyShareLink = async (token) => {
+    const absolute = `${window.location.origin}/api/share/${token}/analysis-data`
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(absolute)
+        setShareMessage('Share link copied to clipboard.')
+      } else {
+        setShareMessage(absolute)
+      }
+    } catch {
+      setShareMessage(absolute)
+    }
+  }
+
   return (
     <section className="analysis-view">
       <section className="card analysis-header-card">
@@ -642,47 +857,274 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
           {walkTitle}
         </h2>
         <p className="analysis-subtitle">{subtitleParts.join(' · ')}</p>
+        <div style={{ marginTop: '0.7rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+          <button className="btn-secondary" type="button" onClick={createShareLink} disabled={shareBusy}>
+            {shareBusy ? 'Working…' : 'Create Share Link'}
+          </button>
+          <span className="analysis-subtitle" style={{ fontSize: '0.8rem' }}>
+            Shared links are public and do not require login.
+          </span>
+        </div>
+        {shareMessage && (
+          <p className={shareMessage.toLowerCase().includes('failed') ? 'msg-error' : 'analysis-subtitle'} style={{ marginTop: '0.55rem' }}>
+            {shareMessage}
+          </p>
+        )}
+        {shareLinks.length > 0 && (
+          <div className="trend-table-wrap" style={{ marginTop: '0.7rem' }}>
+            <table className="trend-table">
+              <thead>
+                <tr>
+                  <th>Created</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {shareLinks.map((link) => {
+                  const active = !link.revoked_at
+                  return (
+                    <tr key={link.token}>
+                      <td>{link.created_at ? new Date(link.created_at).toLocaleString() : 'n/a'}</td>
+                      <td>{active ? 'Active' : 'Revoked'}</td>
+                      <td>
+                        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                          <button className="btn-secondary" type="button" onClick={() => copyShareLink(link.token)}>
+                            Copy
+                          </button>
+                          {active ? (
+                            <button className="btn-danger" type="button" onClick={() => revokeShareLink(link.token)}>
+                              Revoke
+                            </button>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </section>
 
-      <section className="analysis-stats-grid">
-        <Stat label="Distance" value={fmt(metrics.distance_km, 2, ' km')} />
-        <Stat label="Duration" value={fmt(metrics.duration_h, 2, ' h')} />
-        <Stat label="Average HR" value={fmt(metrics.avg_hr, 0, ' bpm')} />
-        <Stat label="BG Delta" value={fmt(metrics.bg_delta, 2, ' mmol/L')} />
-        <Stat label="Time in range" value={fmt(metrics.tir_pct, 0, '%')} />
-        <Stat
-          label="Weather stress"
-          value={`${fmt(metrics.weather_stress_score, 0)}${metrics.weather_stress_band ? ` (${metrics.weather_stress_band})` : ''}`}
-        />
-      </section>
+      <div className="analysis-tabs home-tabs">
+        <button className={`home-tab ${analysisTab === 'general' ? 'home-tab--active' : ''}`} onClick={() => setAnalysisTab('general')} type="button">
+          General
+        </button>
+        <button className={`home-tab ${analysisTab === 'diabetes' ? 'home-tab--active' : ''}`} onClick={() => setAnalysisTab('diabetes')} type="button">
+          Diabetes
+        </button>
+      </div>
 
-      <ChartCard
-        title="Route Map"
-        description="Shows the GPS route of the walk, coloured by heart-rate intensity, with hourly position markers where available."
-        empty={!mapTrack.length ? 'No route map data available.' : null}
-      >
-        <RouteMap track={mapTrack} hourMarkers={mapHourMarkers} />
-      </ChartCard>
+      {analysisTab === 'general' ? (
+        <>
+          <section className="analysis-stats-grid">
+            <Stat label="Distance" value={fmt(metrics.distance_km, 2, ' km')} />
+            <Stat label="Duration" value={fmt(metrics.duration_h, 2, ' h')} />
+            <Stat label="Average HR" value={fmt(metrics.avg_hr, 0, ' bpm')} />
+            <Stat
+              label="Weather stress"
+              value={`${fmt(metrics.weather_stress_score, 0)}${metrics.weather_stress_band ? ` (${metrics.weather_stress_band})` : ''}`}
+            />
+          </section>
 
-      <section className="analysis-chart-grid">
-        <ChartCard
-          title="Activity Timeline"
-          description="Plots altitude and heart rate against distance so you can see how terrain and effort changed across the walk."
-          empty={!activityRows.length ? 'No activity series available.' : null}
-        >
-          <ResponsiveContainer width="100%" height={290}>
-            <LineChart data={activityRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
-              <YAxis yAxisId="alt" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit="m" />
-              <YAxis yAxisId="hr" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
-              <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
-              <Legend />
-              <Line yAxisId="alt" type="monotone" dataKey="altitude_m" name="Altitude" stroke="#5a6f85" dot={false} strokeWidth={2} />
-              <Line yAxisId="hr" type="monotone" dataKey="hr" name="HR" stroke="#ef5b0c" dot={false} strokeWidth={2} />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
+          <ChartCard
+            title="Route Map"
+            description="Shows the GPS route of the walk, coloured by heart-rate intensity, with hourly position markers where available."
+            empty={!mapTrack.length ? 'No route map data available.' : null}
+          >
+            <RouteMap track={mapTrack} hourMarkers={mapHourMarkers} allowBgToggle={false} modeKey="general" />
+          </ChartCard>
+
+          <section className="analysis-chart-grid">
+            <ChartCard
+              title="Activity Timeline"
+              description="Plots altitude and heart rate against distance so you can see how terrain and effort changed across the walk."
+              empty={!activityRows.length ? 'No activity series available.' : null}
+            >
+              <ResponsiveContainer width="100%" height={290}>
+                <LineChart data={activityRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
+                  <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
+                  <YAxis yAxisId="alt" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit="m" />
+                  <YAxis yAxisId="hr" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
+                  <Tooltip
+                    labelFormatter={(v) => `${num(v, 2)} km`}
+                    formatter={(value, name) => {
+                      if (value == null || Number.isNaN(Number(value))) return ['n/a', name]
+                      if (name === 'HR') return [`${num(value, 0)} bpm`, name]
+                      if (name === 'Altitude') return [`${num(value, 0)} m`, name]
+                      return [value, name]
+                    }}
+                  />
+                  <Legend />
+                  <Line yAxisId="alt" type="monotone" dataKey="altitude_m" name="Altitude" stroke="#5a6f85" dot={false} strokeWidth={2} />
+                  <Line yAxisId="hr" type="monotone" dataKey="hr" name="HR" stroke="#ef5b0c" dot={false} strokeWidth={2} />
+                </LineChart>
+              </ResponsiveContainer>
+            </ChartCard>
+
+            <ChartCard
+              title="Weather Along Route"
+              description="Shows temperature, apparent temperature, wind speed, and headwind exposure over the course of the route."
+              empty={!weatherChartRows.length ? 'No weather points available.' : null}
+            >
+              <ResponsiveContainer width="100%" height={290}>
+                <ComposedChart data={weatherChartRowsSmoothed} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
+                  <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
+                  <YAxis yAxisId="temp" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} domain={['dataMin - 1', 'dataMax + 1']} tickFormatter={(v) => num(v, 1)} unit="°C" />
+                  <YAxis yAxisId="wind" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" km/h" />
+                  <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
+                  <Legend />
+                  <Line yAxisId="temp" type="monotone" dataKey="temp_c" name="Temp" stroke="#007f8a" dot={false} connectNulls strokeWidth={2.6} />
+                  <Line yAxisId="temp" type="monotone" dataKey="apparent_c" name="Apparent" stroke="#7b8ea2" dot={false} connectNulls strokeDasharray="5 4" strokeWidth={1.8} />
+                  <Bar yAxisId="wind" dataKey="wind_kph" name="Wind" fill="rgba(239,91,12,0.45)" barSize={8} />
+                  <Line yAxisId="wind" type="monotone" dataKey="headwind_kph" name="Headwind" stroke="#c64200" dot={false} strokeWidth={2} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </ChartCard>
+
+            <ChartCard
+              title="Stress and Decoupling"
+              description="Compares observed heart rate with expected heart rate and highlights the residual gap as a proxy for physiological strain."
+              empty={!stressRows.length ? 'No stress analytics series available.' : null}
+            >
+              <ResponsiveContainer width="100%" height={290}>
+                <LineChart data={stressRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
+                  <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
+                  <YAxis yAxisId="hr" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
+                  <YAxis yAxisId="res" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" bpm" />
+                  <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
+                  <Legend />
+                  <Line yAxisId="hr" type="monotone" dataKey="hr" name="Observed HR" stroke="#ef5b0c" dot={false} strokeWidth={2} />
+                  <Line yAxisId="hr" type="monotone" dataKey="expected_hr" name="Expected HR" stroke="#5f7a96" dot={false} strokeDasharray="5 4" strokeWidth={2} />
+                  <Line yAxisId="res" type="monotone" dataKey="residual_bpm" name="Residual" stroke="#0a8f8f" dot={false} strokeWidth={2} />
+                </LineChart>
+              </ResponsiveContainer>
+            </ChartCard>
+
+            <ChartCard
+              title="Decoupling Trend"
+              description="Summarises how decoupling scores and elevated-strain minutes change across recent walks."
+              empty={!trendRows.length ? 'No trend rows available yet.' : null}
+            >
+              <ResponsiveContainer width="100%" height={290}>
+                <ComposedChart data={trendChartRows} margin={DISTANCE_CHART_MARGIN}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
+                  <XAxis
+                    dataKey="x_index"
+                    type="number"
+                    domain={trendDomain}
+                    ticks={trendTicks}
+                    allowDataOverflow
+                    tickFormatter={(v) => trendTickLabelByIndex.get(v) || ''}
+                  />
+                  <YAxis yAxisId="score" orientation="left" domain={[0, 100]} />
+                  <YAxis yAxisId="mins" orientation="right" />
+                  <Tooltip labelFormatter={(v) => trendTickLabelByIndex.get(v) || String(v)} />
+                  <Legend />
+                  <Line yAxisId="score" type="monotone" dataKey="score" name="Score" stroke="#0a8f8f" strokeWidth={2} />
+                  <Bar yAxisId="mins" dataKey="elevated_minutes" name="Elevated minutes" fill="rgba(239,91,12,0.45)" barSize={18} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </ChartCard>
+          </section>
+
+          <section className="card">
+            <h2>Stress Summary</h2>
+            <div className="analysis-summary-row">
+              <span>Decoupling score:</span>
+              <strong>{fmt(stressSummary.score, 0)}{stressSummary.band ? ` (${stressSummary.band})` : ''}</strong>
+            </div>
+            <div className="analysis-summary-row">
+              <span>Elevated minutes:</span>
+              <strong>{fmt(stressSummary.elevated_minutes, 0, ' min')}</strong>
+            </div>
+            <div className="analysis-summary-row">
+              <span>Max residual:</span>
+              <strong>{fmt(stressSummary.max_residual_bpm, 1, ' bpm')}</strong>
+            </div>
+          </section>
+
+          <section className="card">
+            <h2>Recent Stress Trend</h2>
+            {!trendRows.length ? (
+              <p className="empty">No trend rows available yet.</p>
+            ) : (
+              <div className="trend-table-wrap">
+                <table className="trend-table">
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Walk</th>
+                      <th>Score</th>
+                      <th>Band</th>
+                      <th>Elevated min</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trendRows.map((row) => (
+                      <tr key={`${row.walk_id}-${row.start_time || row.date || ''}`}>
+                        <td>{row.date || 'n/a'}</td>
+                        <td>{row.name || row.walk_id || 'n/a'}</td>
+                        <td>{fmt(row.score, 0)}</td>
+                        <td>{row.band || 'n/a'}</td>
+                        <td>{fmt(row.elevated_minutes, 0)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
+        </>
+      ) : (
+        <>
+          <section className="analysis-stats-grid">
+            <Stat label="BG Delta" value={fmt(metrics.bg_delta, 2, ' mmol/L')} />
+            <Stat label="Time in range" value={fmt(metrics.tir_pct, 0, '%')} />
+            <Stat
+              label="Insulin stress"
+              value={`${fmt(insulinStressSummary.stress_multiplier, 2, 'x')}${insulinStressSummary.band ? ` (${insulinStressSummary.band})` : ''}`}
+            />
+            <Stat
+              label="SmartGuard"
+              value={smartguardSummary.any_activity ? `${fmt(smartguardSummary.predicted_low_suspend_count, 0)} predicted-low` : 'No events'}
+            />
+          </section>
+
+          <ChartCard
+            title="Route Map"
+            description="Shows the GPS route with both heart-rate and glucose colouring modes."
+            empty={!mapTrack.length ? 'No route map data available.' : null}
+          >
+            <RouteMap track={mapTrack} hourMarkers={mapHourMarkers} allowBgToggle modeKey="diabetes" />
+          </ChartCard>
+
+          <section className="analysis-chart-grid">
+            <ChartCard
+              title="Elevation, HR, and BG"
+              description="Combines altitude, heart rate, and glucose so you can spot where climbs and effort coincide with glucose movement."
+              empty={!elevationHrBgChartRows.length || !elevationHrBgChartRows.some((row) => row.bg != null) ? 'No combined elevation/HR/BG points available.' : null}
+            >
+              <ResponsiveContainer width="100%" height={290}>
+                <LineChart data={elevationHrBgChartRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
+                  <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
+                  <YAxis yAxisId="alt" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" m" />
+                  <YAxis yAxisId="hr" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
+                  <YAxis yAxisId="bg" orientation="right" width={0} hide tickFormatter={(v) => num(v, 1)} unit=" mmol/L" />
+                  <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
+                  <Legend />
+                  <Line yAxisId="alt" type="monotone" dataKey="altitude_m" name="Altitude" stroke="#5a6f85" dot={false} strokeWidth={2} connectNulls />
+                  <Line yAxisId="hr" type="monotone" dataKey="hr" name="HR" stroke="#ef5b0c" dot={false} strokeWidth={2} connectNulls />
+                  <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
+                </LineChart>
+              </ResponsiveContainer>
+            </ChartCard>
 
         <ChartCard
           title="Glucose and Insulin"
@@ -700,6 +1142,10 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
                 </span>
               </div>
             )}
+            <div className="insulin-decay-control">
+              <label>Insulin model: {insulinModelMode === INSULIN_MODEL_SMARTGUARD ? 'SmartGuard-adjusted' : 'Normal basal/bolus'}</label>
+              <button className="btn-secondary" type="button" onClick={() => setShowInsulinModelModal(true)}>Change model</button>
+            </div>
             <div className="insulin-decay-control">
               <label htmlFor="effort-hr-reference-range">HR reference: {num(effortHrReference, 0)} bpm</label>
               <input
@@ -738,6 +1184,47 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
             </div>
             <p className="insulin-controls-note">These analytics controls are saved in this browser. Derived analytics remain computed from source data on demand.</p>
           </div>
+
+          {!!smartguardMarkerRows.length && (
+            <div className="insulin-marker-legend" aria-label="SmartGuard markers">
+              <span><i className="marker marker-predicted" />SmartGuard predicted-low suspend</span>
+              <span><i className="marker marker-suspend" />SmartGuard suspend</span>
+              <span><i className="marker marker-resume" />SmartGuard resume</span>
+            </div>
+          )}
+
+          {showInsulinModelModal && (
+            <div className="modal-overlay" role="dialog" aria-modal="true" aria-label="Select insulin model">
+              <div className="modal-panel">
+                <h3>Select Insulin Model</h3>
+                <p className="modal-copy">
+                  Normal mode uses the effort-adjusted bolus decay model. SmartGuard-adjusted mode applies suspend-state dampening when SmartGuard suspend events are present.
+                </p>
+                <label className="modal-option">
+                  <input
+                    type="radio"
+                    name="insulin-model-mode"
+                    checked={insulinModelMode === INSULIN_MODEL_NORMAL}
+                    onChange={() => setInsulinModelMode(INSULIN_MODEL_NORMAL)}
+                  />
+                  <span>Normal basal/bolus model</span>
+                </label>
+                <label className="modal-option">
+                  <input
+                    type="radio"
+                    name="insulin-model-mode"
+                    checked={insulinModelMode === INSULIN_MODEL_SMARTGUARD}
+                    onChange={() => setInsulinModelMode(INSULIN_MODEL_SMARTGUARD)}
+                  />
+                  <span>SmartGuard-adjusted model</span>
+                </label>
+                <div className="modal-actions">
+                  <button className="btn-primary" type="button" onClick={() => setShowInsulinModelModal(false)}>Apply</button>
+                </div>
+              </div>
+            </div>
+          )}
+
           <ResponsiveContainer width="100%" height={290}>
             <ComposedChart
               data={glucoseInsulinChartRows}
@@ -771,6 +1258,43 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
                 }}
               />
               <Legend />
+              {smartguardMarkerRows.map((row, idx) => {
+                const state = row.state || 'other'
+                const stroke = state === 'predicted_low_suspend'
+                  ? '#be2f2f'
+                  : state === 'suspend'
+                    ? '#d16a00'
+                    : state === 'resume'
+                      ? '#1f8a5b'
+                      : '#7b8ea2'
+                const dash = state === 'predicted_low_suspend' ? '1 0' : '5 4'
+                const showPredictedLabel = state === 'predicted_low_suspend' && (
+                  predictedLowMarkerCount <= 3
+                  || (activeDistance != null && Math.abs(Number(row.distance_km) - Number(activeDistance)) <= 0.08)
+                )
+                const label = state === 'predicted_low_suspend'
+                  && showPredictedLabel
+                  ? {
+                    value: 'PLGM',
+                    position: 'insideTop',
+                    fill: '#be2f2f',
+                    fontSize: 10,
+                    fontWeight: 700,
+                  }
+                  : undefined
+                return (
+                  <ReferenceLine
+                    key={`smartguard-marker-${idx}`}
+                    x={row.distance_km}
+                    yAxisId="ins"
+                    stroke={stroke}
+                    strokeWidth={1.7}
+                    strokeDasharray={dash}
+                    label={label}
+                    ifOverflow="extendDomain"
+                  />
+                )
+              })}
               <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
               <Area yAxisId="ins" type="stepAfter" dataKey="basal" name="Basal rate" stroke="#00745a" fill="rgba(0,116,90,0.22)" connectNulls strokeWidth={1.8} />
               <Line yAxisId="ins" type="monotone" dataKey="bolus_decay" name="Bolus decay" stroke="#1f6feb" dot={false} strokeWidth={1.8} connectNulls />
@@ -788,72 +1312,6 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
           </ResponsiveContainer>
         </ChartCard>
 
-        <ChartCard
-          title="Weather Along Route"
-          description="Shows temperature, apparent temperature, wind speed, and headwind exposure over the course of the route."
-          empty={!weatherChartRows.length ? 'No weather points available.' : null}
-        >
-          <ResponsiveContainer width="100%" height={290}>
-            <ComposedChart data={weatherChartRowsSmoothed} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
-              <YAxis yAxisId="temp" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} domain={['dataMin - 1', 'dataMax + 1']} tickFormatter={(v) => num(v, 1)} unit="°C" />
-              <YAxis yAxisId="wind" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" km/h" />
-              <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
-              <Legend />
-              <Line yAxisId="temp" type="monotone" dataKey="temp_c" name="Temp" stroke="#007f8a" dot={false} connectNulls strokeWidth={2.6} />
-              <Line yAxisId="temp" type="monotone" dataKey="apparent_c" name="Apparent" stroke="#7b8ea2" dot={false} connectNulls strokeDasharray="5 4" strokeWidth={1.8} />
-              <Bar yAxisId="wind" dataKey="wind_kph" name="Wind" fill="rgba(239,91,12,0.45)" barSize={8} />
-              <Line yAxisId="wind" type="monotone" dataKey="headwind_kph" name="Headwind" stroke="#c64200" dot={false} strokeWidth={2} />
-            </ComposedChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        <ChartCard
-          title="Stress and Decoupling"
-          description="Compares observed heart rate with expected heart rate and highlights the residual gap as a proxy for physiological strain."
-          empty={!stressRows.length ? 'No stress analytics series available.' : null}
-        >
-          <ResponsiveContainer width="100%" height={290}>
-            <LineChart data={stressRows} syncId="distanceSync" syncMethod="value" margin={DISTANCE_CHART_MARGIN}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
-              <YAxis yAxisId="hr" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
-              <YAxis yAxisId="res" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" bpm" />
-              <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
-              <Legend />
-              <Line yAxisId="hr" type="monotone" dataKey="hr" name="Observed HR" stroke="#ef5b0c" dot={false} strokeWidth={2} />
-              <Line yAxisId="hr" type="monotone" dataKey="expected_hr" name="Expected HR" stroke="#5f7a96" dot={false} strokeDasharray="5 4" strokeWidth={2} />
-              <Line yAxisId="res" type="monotone" dataKey="residual_bpm" name="Residual" stroke="#0a8f8f" dot={false} strokeWidth={2} />
-            </LineChart>
-          </ResponsiveContainer>
-        </ChartCard>
-
-        <ChartCard
-          title="Decoupling Trend"
-          description="Summarises how decoupling scores and elevated-strain minutes change across recent walks."
-          empty={!trendRows.length ? 'No trend rows available yet.' : null}
-        >
-          <ResponsiveContainer width="100%" height={290}>
-            <ComposedChart data={trendChartRows} margin={DISTANCE_CHART_MARGIN}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
-              <XAxis
-                dataKey="x_index"
-                type="number"
-                domain={trendDomain}
-                ticks={trendTicks}
-                allowDataOverflow
-                tickFormatter={(v) => trendTickLabelByIndex.get(v) || ''}
-              />
-              <YAxis yAxisId="score" orientation="left" domain={[0, 100]} />
-              <YAxis yAxisId="mins" orientation="right" />
-              <Tooltip labelFormatter={(v) => trendTickLabelByIndex.get(v) || String(v)} />
-              <Legend />
-              <Line yAxisId="score" type="monotone" dataKey="score" name="Score" stroke="#0a8f8f" strokeWidth={2} />
-              <Bar yAxisId="mins" dataKey="elevated_minutes" name="Elevated minutes" fill="rgba(239,91,12,0.45)" barSize={18} />
-            </ComposedChart>
-          </ResponsiveContainer>
-        </ChartCard>
       </section>
 
       {hasBgInsights && (phaseRows.length > 0 || intensityRows.length > 0) && (
@@ -971,21 +1429,50 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
         </section>
       )}
 
-      <section className="card">
-        <h2>Stress Summary</h2>
-        <div className="analysis-summary-row">
-          <span>Decoupling score:</span>
-          <strong>{fmt(stressSummary.score, 0)}{stressSummary.band ? ` (${stressSummary.band})` : ''}</strong>
-        </div>
-        <div className="analysis-summary-row">
-          <span>Elevated minutes:</span>
-          <strong>{fmt(stressSummary.elevated_minutes, 0, ' min')}</strong>
-        </div>
-        <div className="analysis-summary-row">
-          <span>Max residual:</span>
-          <strong>{fmt(stressSummary.max_residual_bpm, 1, ' bpm')}</strong>
-        </div>
-      </section>
+      {analysisTab === 'general' ? (
+        <section className="card">
+          <h2>Stress Summary</h2>
+          <div className="analysis-summary-row">
+            <span>Decoupling score:</span>
+            <strong>{fmt(stressSummary.score, 0)}{stressSummary.band ? ` (${stressSummary.band})` : ''}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>Elevated minutes:</span>
+            <strong>{fmt(stressSummary.elevated_minutes, 0, ' min')}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>Max residual:</span>
+            <strong>{fmt(stressSummary.max_residual_bpm, 1, ' bpm')}</strong>
+          </div>
+        </section>
+      ) : (
+        <section className="card">
+          <h2>Diabetes Summary</h2>
+          <div className="analysis-summary-row">
+            <span>Insulin stress multiplier:</span>
+            <strong>{fmt(insulinStressSummary.stress_multiplier, 2, 'x')}{insulinStressSummary.band ? ` (${insulinStressSummary.band})` : ''}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>IOB overlap:</span>
+            <strong>{fmt(insulinStressSummary.overlap_minutes, 0, ' min')}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>Peak IOB proxy:</span>
+            <strong>{fmt(insulinStressSummary.peak_iob_units_proxy, 2, ' U')}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>SmartGuard predicted-low suspend:</span>
+            <strong>{fmt(smartguardSummary.predicted_low_suspend_count, 0)}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>SmartGuard suspend/resume:</span>
+            <strong>{fmt(smartguardSummary.suspend_count, 0)} / {fmt(smartguardSummary.resume_count, 0)}</strong>
+          </div>
+        </section>
+      )}
+
+        </>
+      )}
 
       {data.files?.length > 0 && (
         <section className="card">
@@ -1001,37 +1488,39 @@ export default function WalkAnalysisView({ walkId, insulinProfile }) {
         </section>
       )}
 
-      <section className="card">
-        <h2>Recent Stress Trend</h2>
-        {!trendRows.length ? (
-          <p className="empty">No trend rows available yet.</p>
-        ) : (
-          <div className="trend-table-wrap">
-            <table className="trend-table">
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Walk</th>
-                  <th>Score</th>
-                  <th>Band</th>
-                  <th>Elevated min</th>
-                </tr>
-              </thead>
-              <tbody>
-                {trendRows.map((row) => (
-                  <tr key={`${row.walk_id}-${row.start_time || row.date || ''}`}>
-                    <td>{row.date || 'n/a'}</td>
-                    <td>{row.name || row.walk_id || 'n/a'}</td>
-                    <td>{fmt(row.score, 0)}</td>
-                    <td>{row.band || 'n/a'}</td>
-                    <td>{fmt(row.elevated_minutes, 0)}</td>
+      {analysisTab === 'general' && (
+        <section className="card">
+          <h2>Recent Stress Trend</h2>
+          {!trendRows.length ? (
+            <p className="empty">No trend rows available yet.</p>
+          ) : (
+            <div className="trend-table-wrap">
+              <table className="trend-table">
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Walk</th>
+                    <th>Score</th>
+                    <th>Band</th>
+                    <th>Elevated min</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </section>
+                </thead>
+                <tbody>
+                  {trendRows.map((row) => (
+                    <tr key={`${row.walk_id}-${row.start_time || row.date || ''}`}>
+                      <td>{row.date || 'n/a'}</td>
+                      <td>{row.name || row.walk_id || 'n/a'}</td>
+                      <td>{fmt(row.score, 0)}</td>
+                      <td>{row.band || 'n/a'}</td>
+                      <td>{fmt(row.elevated_minutes, 0)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
     </section>
   )
 }
