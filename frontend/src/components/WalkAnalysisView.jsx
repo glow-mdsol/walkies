@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { buildIobFn } from './InsulinSetup'
 import {
   ResponsiveContainer,
   BarChart,
@@ -23,6 +22,48 @@ import {
   CircleMarker,
   Tooltip as LeafletTooltip,
 } from 'react-leaflet'
+
+function buildIobFn(profile) {
+  const onset_s = profile.onsetMins * 60
+  const earlyEnd_s = onset_s + profile.earlyActionMins * 60
+  const peak_s = ((profile.peakMinHours + profile.peakMaxHours) / 2) * 3600
+  const duration_s = ((profile.durationMinHours + profile.durationMaxHours) / 2) * 3600
+
+  function activity(t) {
+    if (t <= onset_s || t >= duration_s) return 0
+    const earlySpan = earlyEnd_s - onset_s
+    const riseSpan = peak_s - earlyEnd_s
+    const fallSpan = duration_s - peak_s
+    if (earlySpan <= 0 || fallSpan <= 0) {
+      if (peak_s <= onset_s) return 0
+      if (t <= peak_s) return (t - onset_s) / (peak_s - onset_s)
+      return (duration_s - t) / (duration_s - peak_s)
+    }
+    if (t <= earlyEnd_s) return 0.5 * (t - onset_s) / earlySpan
+    if (riseSpan > 0 && t <= peak_s) return 0.5 + 0.5 * (t - earlyEnd_s) / riseSpan
+    return (duration_s - t) / fallSpan
+  }
+
+  const N = 600
+  const dt = duration_s / N
+  const acts = Array.from({ length: N + 1 }, (_, i) => activity(i * dt))
+  const suffix = new Float64Array(N + 2)
+  for (let i = N - 1; i >= 0; i--) {
+    suffix[i] = suffix[i + 1] + (acts[i] + acts[i + 1]) * 0.5 * dt
+  }
+  const totalArea = suffix[0]
+  if (totalArea < 1e-9) return () => 0
+
+  return function iob(t_s) {
+    if (t_s <= 0) return 1
+    if (t_s >= duration_s) return 0
+    const idxF = t_s / dt
+    const idx = Math.min(N - 1, Math.floor(idxF))
+    const frac = idxF - idx
+    const partialArea = frac * (acts[idx] + acts[idx + 1]) * 0.5 * dt
+    return (suffix[idx] - partialArea) / totalArea
+  }
+}
 
 function fmt(value, digits = 1, suffix = '') {
   if (value == null || Number.isNaN(value)) return 'n/a'
@@ -361,7 +402,7 @@ function loadAnalyticsPrefs() {
   }
 }
 
-export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
+export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, shareToken }) {
   const initialPrefs = useMemo(() => loadAnalyticsPrefs(), [])
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -378,7 +419,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
   const [shareMessage, setShareMessage] = useState(null)
 
   const loadShareLinks = useCallback(() => {
-    if (!walkId) return
+    if (!walkId || shareToken || !apiFetch) return
     apiFetch(`/api/walks/${encodeURIComponent(walkId)}/share-links`)
       .then(async (res) => {
         if (!res.ok) {
@@ -389,14 +430,18 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
       })
       .then((payload) => setShareLinks(payload.links || []))
       .catch(() => setShareLinks([]))
-  }, [walkId, apiFetch])
+  }, [walkId, shareToken, apiFetch])
 
   useEffect(() => {
-    if (!walkId) return
+    if (!walkId && !shareToken) return
     setLoading(true)
     setError(null)
 
-    apiFetch(`/api/walks/${encodeURIComponent(walkId)}/analysis-data`)
+    const fetchPromise = shareToken
+      ? fetch(`/api/share/${encodeURIComponent(shareToken)}/analysis-data`)
+      : apiFetch(`/api/walks/${encodeURIComponent(walkId)}/analysis-data`)
+
+    fetchPromise
       .then(async (res) => {
         if (!res.ok) {
           const payload = await res.json().catch(() => ({}))
@@ -407,7 +452,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
       .then(setData)
       .catch((err) => setError(err.message || 'Failed to load walk analysis'))
       .finally(() => setLoading(false))
-  }, [walkId, apiFetch])
+  }, [walkId, shareToken, apiFetch])
 
   useEffect(() => {
     loadShareLinks()
@@ -804,7 +849,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
       const res = await apiFetch(`/api/walks/${encodeURIComponent(walkId)}/share-links`, { method: 'POST' })
       const payload = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(payload.detail || 'Failed to create share link')
-      const absolute = `${window.location.origin}${payload.share_path}`
+      const absolute = `${window.location.origin}/?share=${payload.token}`
       if (navigator?.clipboard?.writeText) {
         await navigator.clipboard.writeText(absolute)
         setShareMessage('Share link created and copied to clipboard.')
@@ -837,7 +882,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
   }
 
   const copyShareLink = async (token) => {
-    const absolute = `${window.location.origin}/api/share/${token}/analysis-data`
+    const absolute = `${window.location.origin}/?share=${token}`
     try {
       if (navigator?.clipboard?.writeText) {
         await navigator.clipboard.writeText(absolute)
@@ -857,54 +902,58 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch }) {
           {walkTitle}
         </h2>
         <p className="analysis-subtitle">{subtitleParts.join(' · ')}</p>
-        <div style={{ marginTop: '0.7rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
-          <button className="btn-secondary" type="button" onClick={createShareLink} disabled={shareBusy}>
-            {shareBusy ? 'Working…' : 'Create Share Link'}
-          </button>
-          <span className="analysis-subtitle" style={{ fontSize: '0.8rem' }}>
-            Shared links are public and do not require login.
-          </span>
-        </div>
-        {shareMessage && (
-          <p className={shareMessage.toLowerCase().includes('failed') ? 'msg-error' : 'analysis-subtitle'} style={{ marginTop: '0.55rem' }}>
-            {shareMessage}
-          </p>
-        )}
-        {shareLinks.length > 0 && (
-          <div className="trend-table-wrap" style={{ marginTop: '0.7rem' }}>
-            <table className="trend-table">
-              <thead>
-                <tr>
-                  <th>Created</th>
-                  <th>Status</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {shareLinks.map((link) => {
-                  const active = !link.revoked_at
-                  return (
-                    <tr key={link.token}>
-                      <td>{link.created_at ? new Date(link.created_at).toLocaleString() : 'n/a'}</td>
-                      <td>{active ? 'Active' : 'Revoked'}</td>
-                      <td>
-                        <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
-                          <button className="btn-secondary" type="button" onClick={() => copyShareLink(link.token)}>
-                            Copy
-                          </button>
-                          {active ? (
-                            <button className="btn-danger" type="button" onClick={() => revokeShareLink(link.token)}>
-                              Revoke
-                            </button>
-                          ) : null}
-                        </div>
-                      </td>
+        {!shareToken && (
+          <>
+            <div style={{ marginTop: '0.7rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+              <button className="btn-secondary" type="button" onClick={createShareLink} disabled={shareBusy}>
+                {shareBusy ? 'Working…' : 'Create Share Link'}
+              </button>
+              <span className="analysis-subtitle" style={{ fontSize: '0.8rem' }}>
+                Shared links are public and do not require login.
+              </span>
+            </div>
+            {shareMessage && (
+              <p className={shareMessage.toLowerCase().includes('failed') ? 'msg-error' : 'analysis-subtitle'} style={{ marginTop: '0.55rem' }}>
+                {shareMessage}
+              </p>
+            )}
+            {shareLinks.length > 0 && (
+              <div className="trend-table-wrap" style={{ marginTop: '0.7rem' }}>
+                <table className="trend-table">
+                  <thead>
+                    <tr>
+                      <th>Created</th>
+                      <th>Status</th>
+                      <th>Actions</th>
                     </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+                  </thead>
+                  <tbody>
+                    {shareLinks.map((link) => {
+                      const active = !link.revoked_at
+                      return (
+                        <tr key={link.token}>
+                          <td>{link.created_at ? new Date(link.created_at).toLocaleString() : 'n/a'}</td>
+                          <td>{active ? 'Active' : 'Revoked'}</td>
+                          <td>
+                            <div style={{ display: 'flex', gap: '0.4rem', flexWrap: 'wrap' }}>
+                              <button className="btn-secondary" type="button" onClick={() => copyShareLink(link.token)}>
+                                Copy
+                              </button>
+                              {active ? (
+                                <button className="btn-danger" type="button" onClick={() => revokeShareLink(link.token)}>
+                                  Revoke
+                                </button>
+                              ) : null}
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
         )}
       </section>
 
