@@ -9,6 +9,8 @@ from .db import (
     list_share_links_for_walk,
     revoke_share_link,
     upsert_share_link,
+    get_user_settings,
+    upsert_user_settings,
 )
 from .service import list_walk_analytics, persist_walk_analytics, refresh_walk_analytics_if_needed
 
@@ -26,4 +28,6 @@ __all__ = [
     "refresh_walk_analytics_if_needed",
     "revoke_share_link",
     "upsert_share_link",
+    "get_user_settings",
+    "upsert_user_settings",
 ]

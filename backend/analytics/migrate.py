@@ -9,10 +9,11 @@ from .db import (
     upsert_share_link,
     upsert_walk_analytics,
     upsert_walk_sources,
+    upsert_user_settings,
 )
 
 
-def read_source_rows(source_path: Path) -> tuple[list[dict], list[dict], list[dict]]:
+def read_source_rows(source_path: Path) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     conn = sqlite3.connect(source_path)
     conn.row_factory = sqlite3.Row
     try:
@@ -48,9 +49,16 @@ def read_source_rows(source_path: Path) -> tuple[list[dict], list[dict], list[di
             ).fetchall()]
         else:
             share_links = []
+
+        if 'user_settings' in tables:
+            user_settings = [dict(row) for row in conn.execute(
+                "SELECT user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json, insulin_sensitivity_factor, correction_threshold, exercise_correction_factor, iob_calculation_method, insulin_profile_json, updated_at FROM user_settings"
+            ).fetchall()]
+        else:
+            user_settings = []
     finally:
         conn.close()
-    return walk_sources, walk_analytics, share_links
+    return walk_sources, walk_analytics, share_links, user_settings
 
 
 def migrate_from_sqlite(source_path: Path) -> dict:
@@ -58,7 +66,7 @@ def migrate_from_sqlite(source_path: Path) -> dict:
         raise FileNotFoundError(f"Source sqlite DB not found: {source_path}")
 
     init_analytics_db()
-    walk_sources, walk_analytics, share_links = read_source_rows(source_path)
+    walk_sources, walk_analytics, share_links, user_settings = read_source_rows(source_path)
 
     sources_by_walk: dict[str, list[dict]] = {}
     for row in walk_sources:
@@ -113,12 +121,33 @@ def migrate_from_sqlite(source_path: Path) -> dict:
             revoked_at=row.get('revoked_at'),
         )
 
+    for row in user_settings:
+        import json
+        basal_rates = json.loads(row['basal_rates_json']) if row.get('basal_rates_json') else None
+        carb_ratios = json.loads(row['carb_ratios_json']) if row.get('carb_ratios_json') else None
+        insulin_profile = json.loads(row['insulin_profile_json']) if row.get('insulin_profile_json') else None
+        upsert_user_settings(
+            user_sub=row['user_sub'],
+            settings={
+                'insulin_type': row['insulin_type'],
+                'pump_brand_model': row.get('pump_brand_model'),
+                'basal_rates': basal_rates,
+                'carb_ratios': carb_ratios,
+                'insulin_sensitivity_factor': row.get('insulin_sensitivity_factor'),
+                'correction_threshold': row.get('correction_threshold'),
+                'exercise_correction_factor': row.get('exercise_correction_factor'),
+                'iob_calculation_method': row.get('iob_calculation_method'),
+                'insulin_profile': insulin_profile,
+            }
+        )
+
     return {
         'target_backend': ANALYTICS_ADAPTER.kind,
         'source_path': str(source_path),
         'walk_source_rows': len(walk_sources),
         'walk_analytics_rows': len(walk_analytics),
         'share_link_rows': len(share_links),
+        'user_settings_rows': len(user_settings),
     }
 
 
@@ -138,6 +167,7 @@ def main() -> int:
         f"walk_sources={result['walk_source_rows']}",
         f"walk_analytics={result['walk_analytics_rows']}",
         f"share_links={result['share_link_rows']}",
+        f"user_settings={result['user_settings_rows']}",
         sep='\n  ',
     )
     return 0

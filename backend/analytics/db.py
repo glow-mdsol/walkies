@@ -62,6 +62,20 @@ def init_analytics_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_share_links_owner_walk
                 ON share_links(owner_sub, walk_id, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_sub TEXT PRIMARY KEY,
+                insulin_type TEXT NOT NULL,          -- 'None', 'MDI', 'Pump'
+                pump_brand_model TEXT,
+                basal_rates_json TEXT,
+                carb_ratios_json TEXT,
+                insulin_sensitivity_factor REAL,
+                correction_threshold REAL,
+                exercise_correction_factor REAL,
+                iob_calculation_method TEXT,
+                insulin_profile_json TEXT,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         # Idempotent migrations for older DB files that predate these columns.
@@ -277,3 +291,97 @@ def revoke_share_link(token: str, owner_sub: str, revoked_at: str) -> bool:
             (revoked_at, token, owner_sub),
         )
         return cursor.rowcount > 0
+
+
+def get_user_settings(user_sub: str) -> dict | None:
+    with analytics_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
+                   insulin_sensitivity_factor, correction_threshold, exercise_correction_factor,
+                   iob_calculation_method, insulin_profile_json, updated_at
+            FROM user_settings
+            WHERE user_sub = ?
+            """,
+            (user_sub,),
+        ).fetchone()
+    if not row:
+        return None
+    res = dict(row)
+    res['basal_rates'] = json.loads(res['basal_rates_json']) if res.get('basal_rates_json') else None
+    res['carb_ratios'] = json.loads(res['carb_ratios_json']) if res.get('carb_ratios_json') else None
+    res['insulin_profile'] = json.loads(res['insulin_profile_json']) if res.get('insulin_profile_json') else None
+    res.pop('basal_rates_json', None)
+    res.pop('carb_ratios_json', None)
+    res.pop('insulin_profile_json', None)
+    return res
+
+
+def upsert_user_settings(user_sub: str, settings: dict) -> None:
+    from datetime import datetime, timezone
+    
+    insulin_type = settings.get("insulin_type", "None")
+    if insulin_type not in ("None", "MDI", "Pump"):
+        insulin_type = "None"
+        
+    if insulin_type == "None":
+        pump_brand_model = None
+        basal_rates_json = None
+        carb_ratios_json = None
+        insulin_sensitivity_factor = None
+        correction_threshold = None
+        exercise_correction_factor = None
+        iob_calculation_method = None
+        insulin_profile_json = None
+    else:
+        pump_brand_model = settings.get("pump_brand_model")
+        if insulin_type == "MDI":
+            basal_rates_json = None
+        else:
+            basal_rates_json = json.dumps(settings.get("basal_rates")) if settings.get("basal_rates") is not None else None
+        carb_ratios_json = json.dumps(settings.get("carb_ratios")) if settings.get("carb_ratios") is not None else None
+        insulin_sensitivity_factor = settings.get("insulin_sensitivity_factor")
+        correction_threshold = settings.get("correction_threshold")
+        exercise_correction_factor = settings.get("exercise_correction_factor")
+        iob_calculation_method = settings.get("iob_calculation_method")
+        insulin_profile_json = json.dumps(settings.get("insulin_profile")) if settings.get("insulin_profile") is not None else None
+
+    updated_at = datetime.now(timezone.utc).isoformat()
+    
+    with analytics_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_settings (
+                user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
+                insulin_sensitivity_factor, correction_threshold, exercise_correction_factor,
+                iob_calculation_method, insulin_profile_json, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_sub) DO UPDATE SET
+                insulin_type = excluded.insulin_type,
+                pump_brand_model = excluded.pump_brand_model,
+                basal_rates_json = excluded.basal_rates_json,
+                carb_ratios_json = excluded.carb_ratios_json,
+                insulin_sensitivity_factor = excluded.insulin_sensitivity_factor,
+                correction_threshold = excluded.correction_threshold,
+                exercise_correction_factor = excluded.exercise_correction_factor,
+                iob_calculation_method = excluded.iob_calculation_method,
+                insulin_profile_json = excluded.insulin_profile_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                user_sub,
+                insulin_type,
+                pump_brand_model,
+                basal_rates_json,
+                carb_ratios_json,
+                insulin_sensitivity_factor,
+                correction_threshold,
+                exercise_correction_factor,
+                iob_calculation_method,
+                insulin_profile_json,
+                updated_at
+            )
+        )
+
+

@@ -34,6 +34,8 @@ from analytics import (
     persist_walk_analytics,
     refresh_walk_analytics_if_needed,
     revoke_share_link,
+    get_user_settings,
+    upsert_user_settings,
 )
 
 app = FastAPI()
@@ -1866,7 +1868,22 @@ def _json_with_cache(payload: dict, request: Request, *, public: bool) -> Respon
 @app.post("/api/walks/parse-fit-date")
 async def parse_fit_date(file: UploadFile = File(...), user: dict = Depends(_require_user)):
     _ = user
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename missing")
+    
+    # Sanitize filename and validate .fit extension
+    safe_filename = Path(file.filename.replace('\\', '/')).name
+    if not safe_filename or safe_filename in ('.', '..'):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if not safe_filename.lower().endswith('.fit'):
+        raise HTTPException(status_code=400, detail="Only .fit files are supported")
+        
     data = await file.read()
+    
+    # Enforce 10MB size limit
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File exceeds maximum allowed size of 10MB")
+        
     date_str = _fit_start_date(data)
     if not date_str:
         raise HTTPException(status_code=422, detail="Could not extract date from FIT file")
@@ -1936,16 +1953,42 @@ async def upload_files(
     fit_end_dt: datetime | None = None
     fit_identity: str | None = None
     has_uploaded_carelink_csv = False
+    
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+    
     for file in files:
         if not file.filename:
             continue
+            
+        # 1. Sanitize filename to prevent directory traversal
+        safe_filename = Path(file.filename.replace('\\', '/')).name
+        if not safe_filename or safe_filename in ('.', '..'):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+            
+        # 2. Validate file extension allow-list
+        ext = Path(safe_filename).suffix.lower()
+        if ext not in ('.fit', '.csv', '.gpx'):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type '{ext}' for file '{safe_filename}'. Only .fit, .csv, and .gpx files are allowed."
+            )
+            
         data = await file.read()
-        prepared_files.append((file.filename, data))
-        if fit_start_dt is None and file.filename.lower().endswith('.fit'):
+        
+        # 3. Enforce maximum file size limit
+        if len(data) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File '{safe_filename}' exceeds the maximum allowed size of 10MB"
+            )
+            
+        prepared_files.append((safe_filename, data))
+        
+        if fit_start_dt is None and safe_filename.lower().endswith('.fit'):
             fit_start_dt, fit_end_dt = _fit_time_bounds(data)
-        if fit_identity is None and file.filename.lower().endswith('.fit'):
+        if fit_identity is None and safe_filename.lower().endswith('.fit'):
             fit_identity = _fit_file_identity(data)
-        if file.filename.lower().endswith('.csv'):
+        if safe_filename.lower().endswith('.csv'):
             has_uploaded_carelink_csv = True
 
     if fit_identity is not None:
@@ -2628,3 +2671,30 @@ def route_compare(group_id: str, user: dict = Depends(_require_user)):
             for r in group_walks
         ],
     }
+
+
+@app.get('/api/user/settings')
+def get_settings(user: dict = Depends(_require_user)):
+    settings = get_user_settings(user['sub'])
+    if settings is None:
+        default_settings = {
+            "insulin_type": "None",
+            "pump_brand_model": None,
+            "basal_rates": None,
+            "carb_ratios": None,
+            "insulin_sensitivity_factor": None,
+            "correction_threshold": None,
+            "exercise_correction_factor": None,
+            "iob_calculation_method": None,
+            "insulin_profile": None,
+        }
+        upsert_user_settings(user['sub'], default_settings)
+        settings = get_user_settings(user['sub'])
+    return settings
+
+
+@app.post('/api/user/settings')
+def update_settings(settings: dict, user: dict = Depends(_require_user)):
+    upsert_user_settings(user['sub'], settings)
+    return {"status": "ok"}
+
