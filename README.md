@@ -20,7 +20,7 @@ The app stores uploaded files by walk date and serves a single analysis view tha
 
 ![Walkies walk list](img/walks.png)
 
-The landing page lists uploaded walks and gives quick access to analysis views and file management.
+The landing page provides a secure access screen. Unauthenticated visitors can sign in using Google Login or enter a shared route code to view a shared analysis. Once authenticated, the page displays the list of uploaded walks, letting you view individual analysis files, route comparisons, and manage files.
 
 ### Analysis Overview
 
@@ -50,17 +50,25 @@ The map view shows the route coloured by heart-rate intensity, with hourly marke
 
 Walkies includes a persistent insulin profile so the bolus decay curve can be tailored to the insulin you actually use rather than relying on a fixed generic duration.
 
-### Profile Setup
+### Profile Setup & Templates
 
 ![Walkies insulin profile setup](img/insulin_prof.png)
 
-The setup screen stores the insulin name, onset, early action, peak window, and total duration range in the browser. This only needs to be configured once unless you want to change the model.
+The setup screen lets you customize your insulin configuration. For fast setup, the app provides standard predefined configurations for common fast-acting and short-acting insulins:
+- **Fiasp (Ultra-Rapid)**
+- **NovoRapid (Rapid)**
+- **Humalog (Rapid)**
+- **Apidra (Rapid)**
+- **Actrapid (Short-Acting / Regular)**
+- **Humulin S (Short-Acting / Regular)**
+
+Selecting one of these templates automatically configures standard clinical values for onset time, early action time, peak action window, and total duration. If you adjust any slider or modify the name, the profile automatically switches to **Custom (Enter manually)** so you can fine-tune parameters to your body's kinetics.
 
 ### Profile Applied In Analysis
 
 ![Walkies insulin profile in analysis](img/insulin_profsel.png)
 
-The selected insulin profile is then shown in the Glucose and Insulin panel and used to drive the active insulin curve drawn alongside basal and bolus data.
+The selected insulin profile is shown as an active badge in the Glucose and Insulin panel and drives the pharmacokinetic active insulin on board (IOB) decay curve drawn alongside basal and bolus data.
 
 ## Stack
 
@@ -177,18 +185,16 @@ The compose stack keeps uploaded walk files and the Postgres data directory in D
 
 ### Authentication Configuration
 
-Walkies now uses Google sign-in and backend token verification.
+Walkies uses Google sign-in and backend token verification. For local development, these variables are configured in a single `.env` file in the project root (which is automatically loaded for both backend and frontend dev tasks):
 
-Frontend (`frontend/.env.local`):
-
-```bash
-VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
-```
-
-Backend (`backend/.env` or process env):
+Root `.env` configuration:
 
 ```bash
 GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
+VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
+
+# Optional dev-only bypass (never enable in production)
+WALKIES_DEV_BYPASS_AUTH=1
 ```
 
 Analytics DB backend (optional, defaults to local sqlite file):
@@ -213,11 +219,54 @@ Typical rollout flow:
 2. Run `task analytics:migrate` once.
 3. Start the backend against the new database.
 
-Optional dev-only bypass (never enable in production):
+## Production Deployment (Google Cloud Platform)
 
+This project can be deployed to Google Cloud Platform (GCP) entirely within their free tier boundaries (using Google Cloud Run, Firebase Hosting, Google Cloud Storage, and a free Neon.tech serverless PostgreSQL database).
+
+### 1. Prerequisites
+- Google Cloud SDK (`gcloud` CLI) installed and authenticated on your local machine (`gcloud auth login`).
+- A GCP Project created (note the Project ID).
+- A free database account at [Neon](https://neon.tech/) to get a PostgreSQL connection string.
+
+### 2. Provision Resources
+We provide a helper script to configure the GCP services. Run it locally using your authenticated terminal:
 ```bash
-WALKIES_DEV_BYPASS_AUTH=1
+chmod +x deploy.sh
+./deploy.sh <YOUR_PROJECT_ID> <YOUR_REGION>
 ```
+*Note: If no region is provided, it defaults to `us-central1`.*
+
+This script will:
+- Enable the necessary GCP APIs.
+- Create an Artifact Registry repository (`walkies-repo`) for Docker images.
+- Create a Cloud Storage bucket (`gs://walkies-data-<project-id>`) for durable FIT and CSV file storage.
+- Create a deployment Service Account (`walkies-deployer`) with permissions.
+- Generate a local credentials key file (`walkies-deployer-key.json`) for GitHub Actions.
+
+### 3. Initialize Firebase Hosting
+Go to the [Firebase Console](https://console.firebase.google.com/), select your existing GCP project, go to **Hosting**, and click **Get Started** to initialize the hosting project.
+
+### 4. Configure GitHub Secrets
+Go to your GitHub repository **Settings > Secrets and variables > Actions** and add the following secrets:
+- `GCP_PROJECT_ID`: Your GCP project ID.
+- `GCP_SA_KEY`: The entire contents of the generated `walkies-deployer-key.json` file.
+- `GCP_REGION`: The region you selected (e.g., `us-central1`).
+- `GOOGLE_CLIENT_ID`: Your Google OAuth 2.0 Client ID.
+- `ANALYTICS_DB_URL`: The Neon serverless PostgreSQL connection string.
+
+*After saving the `GCP_SA_KEY` to GitHub, safely delete `walkies-deployer-key.json` from your local machine. Do not commit this file.*
+
+### 5. Deploy
+Push the codebase to the `main` branch of your GitHub repository. The Actions workflow in `.github/workflows/deploy.yml` will trigger, build, and deploy the application.
+
+### 6. Post-Deployment Steps
+- **OAuth Redirect URIs:** Add your Firebase Hosting URL (e.g., `https://<project-id>.web.app`) to your Google Cloud Console OAuth credentials under "Authorized JavaScript Origins" and "Authorized Redirect URIs" so sign-in works in production.
+- **Run Migrations:** Run the migration script against production:
+  ```bash
+  # In your local terminal, temporarily override ANALYTICS_DB_URL:
+  export ANALYTICS_DB_URL="postgresql://user:password@host/dbname?sslmode=require"
+  task analytics:migrate
+  ```
 
 ## Available Tasks
 
