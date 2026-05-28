@@ -1,5 +1,7 @@
 version: '3'
 
+dotenv: ['.env']
+
 tasks:
   default:
     cmds:
@@ -63,3 +65,10 @@ tasks:
     dir: backend
     cmds:
       - uv run python -m analytics.migrate
+
+  test:
+    desc: Run backend unit tests with pytest
+    dir: backend
+    cmds:
+      - uv run pytest tests/
+

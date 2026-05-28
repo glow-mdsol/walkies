@@ -2,6 +2,18 @@
 
 This file is intended to be read by an LLM working on this project. Each feature includes enough context to implement it without requiring clarification. Read CLAUDE.md first for data formats, clinical parameters, and architecture overview.
 
+## General
+
+This is a fun project for me, so let's keep the costs minimal.  Where possible, use open source libraries and free services.  Where possible, use Python libraries and free services.  
+
+I want to be able to share the experience with other people, so it should support running locally or be deployed and run on inexpensive cloud infrastructure.  I would prefer using Google Cloud infrastructure.  That means that the app should run in Docker and containerization should be used for deployment.  
+
+The code should follow the practices described in CLAUDE.md and be well documented.  Ensure that the code is well tested and that there are unit tests for all the major functionality.  The tests should be stored in the `tests` directory and should follow the practices described in CLAUDE.md.
+
+This data can be extremely sensitive, so ensure that all data is stored securely and that there are appropriate measures in place to protect the data from unauthorised access.  ie no data in the code, no data in the git repo etc.  Use environment variables and secrets management to store sensitive data.
+
+Ensure that wherever possible data is protected (encrypted) at rest and in transit.   ie Use encryption for sensitive data at rest and in transit.  Don't store passwords in the code.  Use environment variables.
+
 ---
 
 ## Per-walk analysis enhancements
@@ -32,6 +44,43 @@ The Guardian 4 CGM has gaps (calibration, sensor warmup, adhesion loss). Detect 
 
 ### Standalone HTML export
 Generate a self-contained `.html` file for a walk (embedding Plotly charts, the Folium map, and summary stats inline) that can be saved and revisited without the app running. Trigger via a "Download report" button in `WalkAnalysisView`. Backend endpoint: `GET /api/walks/{date}/report.html`. Use the `plotly` and `folium` Python libraries already listed in CLAUDE.md preferences.
+
+---
+
+## Data Source Support
+
+### Support Dexcom CSV imports
+Support loading glucose data from the DEXCOM sensor extract (as CSV).  It should support as many of the features as possible of the Medtronic CSV imports.  It's important to consider what fields should be extracted for an extract for each manufacturer.  
+For example, Dexcom does not include bolus data in its extracts, so it will not be possible to show bolus markers on the charts.  On the other hand, Dexcom does not include auto mode, so it will not be possible to show auto mode annotations on the charts.  
+
+
+### Support Tandem Pump data formats
+Research what features are available to be extracted for Tandem Pumps.  To get feature parity with Medtronic Pump data, it may be necessary to support both Tandem Data and Dexcom in a generic way.  Research the methods for extracting the data, what formats are used and how best to support this.
+
+
+### Multiple Data Sources
+The UI should support a choice for either; No insulin pump data, Medtronic Format (Carelink) and Dexcom Format.  If the Tandem Pump data is available, that should be an option as well.  Each of these data sources should be able to be imported independently, and the UI should allow the user to select which data source to use for a given walk.  The import process should be the same as the current import process for Medtronic data.  (ie upload a CSV file)   
+
+### DONE - Insulin Treatment Dashboard
+When a User registers for the app, they should be asked if they use an Insulin Pump and if so, which type.  If they use Medtronic, Dexcom, or Tandem, the app should automatically select the correct data source.  If they use multiple sources, they should be able to select which data source to use for a given walk.  
+In addition to selecting the data source, the user should be able to enter their insulin treatment plan.  This should include:
+- Insulin Type (MDI or Pump)
+- Pump Brand and Model
+- Basal Rates (default and exercise)
+- Carb Ratios
+- Insulin Sensitivity Factor
+- Correction Threshold
+- Exercise Correction Factor
+- Insulin on Board Calculation Method
+
+This information should be stored in the database and used to provide personalized insights and recommendations to the user.  It should also be displayed on the Walk Analysis View when the user is viewing a walk.  The treatment plan should be displayed in a way that is easy to understand and use.  The treatment plan should also be used to calculate the expected BG drop during a walk and compare it to the actual BG drop.  This will allow the user to see if their treatment plan is effective and if they need to make any adjustments.
+
+### Automated extraction of Data Sources
+The source data is extracted from data portals (eg Garmin Connect, Carelink).  Investigate whether it is possible to automate the extraction of this data.  Do they make available a API that can be used to extract the data?  Are there libraries that can be used to extract the data?  
+
+It should be possible to have a button on the Dashboard to allow the user to "pull" the latest data from the data sources.  If the data is available, it should be added to the database and the user should be notified that the data has been added.  The data should be added to the database in a way that is easy to understand and use.  The data should also be used to provide personalized insights and recommendations to the user.  The user should be able to select which data source to use for a given walk.  The data source should be displayed on the Walk Analysis View when the user is viewing a walk.   
+
+Ensure that if credentials are required, these are protected to the highest level.
 
 ---
 
