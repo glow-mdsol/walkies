@@ -49,6 +49,12 @@ Generate a self-contained `.html` file for a walk (embedding Plotly charts, the 
 
 ## Data Source Support
 
+### Automated Ingestion
+Allow a user to connect to the upstream systems and pull data in automatically.  This should be done in a way that is secure and private.  The user should be able to select which data source to use for a given walk.  The data source should be displayed on the Walk Analysis View when the user is viewing a walk.   It's possible there are existing APIs/libraries for automated ingestion.  Do some research on the best way to implement this.
+
+Make sure that a user's credentials are secure and private.  I would suggest that the user stores their credentials in the app, and only the app has access to them.
+
+
 ### Support Dexcom CSV imports
 Support loading glucose data from the DEXCOM sensor extract (as CSV).  It should support as many of the features as possible of the Medtronic CSV imports.  It's important to consider what fields should be extracted for an extract for each manufacturer.  
 For example, Dexcom does not include bolus data in its extracts, so it will not be possible to show bolus markers on the charts.  On the other hand, Dexcom does not include auto mode, so it will not be possible to show auto mode annotations on the charts.  
