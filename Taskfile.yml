@@ -66,6 +66,30 @@ tasks:
     cmds:
       - uv run python -m analytics.migrate
 
+  sources:install:
+    desc: Install the source-review tooling dependency group (pypdf, anthropic)
+    dir: backend
+    cmds:
+      - uv sync --group sources
+
+  sources:list:
+    desc: List the source PDFs that would be digested
+    dir: backend
+    cmds:
+      - uv run --group sources python -m sources_review --list
+
+  sources:digest:
+    desc: Extract + compact the PDFs in sources/ into sources/DIGEST.md (heuristic)
+    dir: backend
+    cmds:
+      - uv run --group sources python -m sources_review {{.CLI_ARGS}}
+
+  sources:digest:llm:
+    desc: As sources:digest but enrich summaries with Claude (needs ANTHROPIC_API_KEY)
+    dir: backend
+    cmds:
+      - uv run --group sources python -m sources_review --llm {{.CLI_ARGS}}
+
   test:
     desc: Run backend unit tests with pytest
     dir: backend
