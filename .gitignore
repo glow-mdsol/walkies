@@ -25,3 +25,7 @@ data/*
 client_secret*.json
 
 .claude/
+
+sources/*.pdf
+# Generated digest contains verbatim extracts from the (copyrighted) source PDFs
+sources/DIGEST.md
