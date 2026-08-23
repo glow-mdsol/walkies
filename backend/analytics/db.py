@@ -65,6 +65,7 @@ def init_analytics_db() -> None:
 
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_sub TEXT PRIMARY KEY,
+                user_type TEXT,                      -- 'diabetic_pump', 'diabetic_mdi', 'non_diabetic_cgm', 'non_diabetic'
                 insulin_type TEXT NOT NULL,          -- 'None', 'MDI', 'Pump'
                 pump_brand_model TEXT,
                 basal_rates_json TEXT,
@@ -87,6 +88,10 @@ def init_analytics_db() -> None:
                 conn.execute(f"ALTER TABLE walk_analytics ADD COLUMN {col} {typedef}")
             except Exception:
                 pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE user_settings ADD COLUMN user_type TEXT")
+        except Exception:
+            pass  # column already exists
 
 
 def upsert_walk_sources(walk_id: str, source_rows: list[dict]) -> None:
@@ -297,7 +302,7 @@ def get_user_settings(user_sub: str) -> dict | None:
     with analytics_conn() as conn:
         row = conn.execute(
             """
-            SELECT user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
+            SELECT user_sub, user_type, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
                    insulin_sensitivity_factor, correction_threshold, exercise_correction_factor,
                    iob_calculation_method, insulin_profile_json, updated_at
             FROM user_settings
@@ -320,8 +325,26 @@ def get_user_settings(user_sub: str) -> dict | None:
 def upsert_user_settings(user_sub: str, settings: dict) -> None:
     from datetime import datetime, timezone
     
+    user_type = settings.get("user_type")
     insulin_type = settings.get("insulin_type", "None")
-    if insulin_type not in ("None", "MDI", "Pump"):
+    
+    if not user_type:
+        if insulin_type == "Pump":
+            user_type = "diabetic_pump"
+        elif insulin_type == "MDI":
+            user_type = "diabetic_mdi"
+        else:
+            user_type = "non_diabetic"
+            
+    if user_type not in ("diabetic_pump", "diabetic_mdi", "non_diabetic_cgm", "non_diabetic"):
+        user_type = "non_diabetic"
+
+    # Enforce logical consistency for insulin_type based on user_type
+    if user_type == "diabetic_pump":
+        insulin_type = "Pump"
+    elif user_type == "diabetic_mdi":
+        insulin_type = "MDI"
+    else:
         insulin_type = "None"
         
     if insulin_type == "None":
@@ -352,12 +375,13 @@ def upsert_user_settings(user_sub: str, settings: dict) -> None:
         conn.execute(
             """
             INSERT INTO user_settings (
-                user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
+                user_sub, user_type, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
                 insulin_sensitivity_factor, correction_threshold, exercise_correction_factor,
                 iob_calculation_method, insulin_profile_json, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_sub) DO UPDATE SET
+                user_type = excluded.user_type,
                 insulin_type = excluded.insulin_type,
                 pump_brand_model = excluded.pump_brand_model,
                 basal_rates_json = excluded.basal_rates_json,
@@ -371,6 +395,7 @@ def upsert_user_settings(user_sub: str, settings: dict) -> None:
             """,
             (
                 user_sub,
+                user_type,
                 insulin_type,
                 pump_brand_model,
                 basal_rates_json,
@@ -380,8 +405,15 @@ def upsert_user_settings(user_sub: str, settings: dict) -> None:
                 exercise_correction_factor,
                 iob_calculation_method,
                 insulin_profile_json,
-                updated_at
+                updated_at,
             )
         )
 
 
+def delete_user_data(user_sub: str, walk_ids: list[str]) -> None:
+    with analytics_conn() as conn:
+        conn.execute("DELETE FROM user_settings WHERE user_sub = ?", (user_sub,))
+        conn.execute("DELETE FROM share_links WHERE owner_sub = ?", (user_sub,))
+        for walk_id in walk_ids:
+            conn.execute("DELETE FROM walk_sources WHERE walk_id = ?", (walk_id,))
+            conn.execute("DELETE FROM walk_analytics WHERE walk_id = ?", (walk_id,))

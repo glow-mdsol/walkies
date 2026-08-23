@@ -11,6 +11,7 @@ from .db import (
     upsert_share_link,
     get_user_settings,
     upsert_user_settings,
+    delete_user_data,
 )
 from .service import list_walk_analytics, persist_walk_analytics, refresh_walk_analytics_if_needed
 
@@ -30,4 +31,5 @@ __all__ = [
     "upsert_share_link",
     "get_user_settings",
     "upsert_user_settings",
+    "delete_user_data",
 ]

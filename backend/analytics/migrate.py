@@ -51,9 +51,14 @@ def read_source_rows(source_path: Path) -> tuple[list[dict], list[dict], list[di
             share_links = []
 
         if 'user_settings' in tables:
-            user_settings = [dict(row) for row in conn.execute(
-                "SELECT user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json, insulin_sensitivity_factor, correction_threshold, exercise_correction_factor, iob_calculation_method, insulin_profile_json, updated_at FROM user_settings"
-            ).fetchall()]
+            try:
+                user_settings = [dict(row) for row in conn.execute(
+                    "SELECT user_sub, user_type, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json, insulin_sensitivity_factor, correction_threshold, exercise_correction_factor, iob_calculation_method, insulin_profile_json, updated_at FROM user_settings"
+                ).fetchall()]
+            except Exception:
+                user_settings = [dict(row) for row in conn.execute(
+                    "SELECT user_sub, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json, insulin_sensitivity_factor, correction_threshold, exercise_correction_factor, iob_calculation_method, insulin_profile_json, updated_at FROM user_settings"
+                ).fetchall()]
         else:
             user_settings = []
     finally:
@@ -129,6 +134,7 @@ def migrate_from_sqlite(source_path: Path) -> dict:
         upsert_user_settings(
             user_sub=row['user_sub'],
             settings={
+                'user_type': row.get('user_type'),
                 'insulin_type': row['insulin_type'],
                 'pump_brand_model': row.get('pump_brand_model'),
                 'basal_rates': basal_rates,

@@ -36,6 +36,7 @@ from analytics import (
     revoke_share_link,
     get_user_settings,
     upsert_user_settings,
+    delete_user_data,
 )
 
 app = FastAPI()
@@ -1800,6 +1801,331 @@ def _insulin_stress_effect_analytics(
     }
 
 
+def _sensor_gap_detection(activity_points: list[dict], bg_points_all: list[dict]) -> list[dict]:
+    """Detect CGM sensor gaps > 15 min during the walk window."""
+    if not activity_points or len(bg_points_all) < 2:
+        return []
+
+    walk_start = datetime.fromisoformat(activity_points[0]['timestamp_iso'])
+    walk_end = datetime.fromisoformat(activity_points[-1]['timestamp_iso'])
+
+    walk_bg_times: list[datetime] = []
+    for p in bg_points_all:
+        try:
+            ts = datetime.fromisoformat(p['timestamp'])
+        except (KeyError, ValueError):
+            continue
+        if walk_start <= ts <= walk_end:
+            walk_bg_times.append(ts)
+    walk_bg_times.sort()
+
+    gap_threshold = timedelta(minutes=15)
+    gaps: list[dict] = []
+    for i in range(1, len(walk_bg_times)):
+        gap = walk_bg_times[i] - walk_bg_times[i - 1]
+        if gap > gap_threshold:
+            gaps.append({
+                'start': walk_bg_times[i - 1].isoformat(),
+                'end': walk_bg_times[i].isoformat(),
+                'duration_min': round(gap.total_seconds() / 60.0, 1),
+            })
+    return gaps
+
+
+def _extended_recovery_phases(activity_points: list[dict], bg_points_all: list[dict]) -> list[dict]:
+    """BG in 0–2 h, 2–6 h, 6–12 h post-walk for delayed-hypo detection.
+
+    Nocturnal hypo risk can persist 6–12 h after prolonged aerobic exercise.
+    The 8.0 mmol/L threshold in the early window is the carbohydrate-intake
+    trigger from Scott et al. 2021 (Lancet D&E 9:304-17).
+    """
+    if not activity_points:
+        return []
+
+    walk_end = datetime.fromisoformat(activity_points[-1]['timestamp_iso'])
+    phase_defs = [
+        ('post_0_2h',  '0–2 h post',  walk_end,                         walk_end + timedelta(hours=2)),
+        ('post_2_6h',  '2–6 h post',  walk_end + timedelta(hours=2),    walk_end + timedelta(hours=6)),
+        ('post_6_12h', '6–12 h post', walk_end + timedelta(hours=6),    walk_end + timedelta(hours=12)),
+    ]
+
+    all_bg: list[tuple[datetime, float]] = []
+    for p in bg_points_all:
+        try:
+            all_bg.append((datetime.fromisoformat(p['timestamp']), float(p['bg'])))
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    phases: list[dict] = []
+    for key, label, start_dt, end_dt in phase_defs:
+        phase_bg = [(ts, bg) for ts, bg in all_bg if start_dt <= ts < end_dt]
+        if not phase_bg:
+            phases.append({
+                'key': key, 'label': label, 'count': 0,
+                'min_bg': None, 'mean_bg': None, 'hypos': 0, 'slope_per_hour': None,
+            })
+            continue
+        values = [bg for _, bg in phase_bg]
+        phases.append({
+            'key': key,
+            'label': label,
+            'count': len(phase_bg),
+            'min_bg': round(min(values), 2),
+            'mean_bg': round(sum(values) / len(values), 2),
+            'hypos': sum(1 for v in values if v <= 3.9),
+            'slope_per_hour': _bg_slope_per_hour(phase_bg),
+        })
+    return phases
+
+
+def _detect_ihe_bursts(activity_points: list[dict], max_hr_reference: float = 175.0) -> int:
+    """Count intermittent high-intensity HR excursions (IHE) during the walk.
+
+    IHE paper 2024 (doi:10.1016/j.diabres.2024.111631): short bursts at ≥85% HRmax
+    interspersed in zone-2/3 aerobic work attenuate glucose drop by ~1.47 mmol/L
+    vs continuous moderate exercise (CME).
+
+    A burst is a contiguous run of activity_points where HR ≥ 85% HRmax lasting ≥ 10 s.
+    """
+    threshold = 0.85 * max_hr_reference
+    pts = sorted(activity_points, key=lambda p: p['timestamp'])
+    burst_count = 0
+    in_burst = False
+    burst_start_ts: float | None = None
+    for p in pts:
+        hr = p.get('hr')
+        if hr is None:
+            if in_burst:
+                in_burst = False
+            continue
+        ts = float(p['timestamp'])
+        if hr >= threshold:
+            if not in_burst:
+                in_burst = True
+                burst_start_ts = ts
+        else:
+            if in_burst and burst_start_ts is not None:
+                if ts - burst_start_ts >= 10.0:
+                    burst_count += 1
+            in_burst = False
+            burst_start_ts = None
+    if in_burst and burst_start_ts is not None:
+        last_ts = float(pts[-1]['timestamp'])
+        if last_ts - burst_start_ts >= 10.0:
+            burst_count += 1
+    return burst_count
+
+
+def _exercise_risk_profile(
+    activity_points: list[dict],
+    bg_points_all: list[dict],
+    metrics: dict,
+    recovery_phases: list[dict],
+    bolus_events_all: list[dict] | None = None,
+) -> dict:
+    """Evidence-based risk assessment and next-walk preparation guide.
+
+    Clinical basis:
+    - Riddell et al. 2017, PMID 28126459: intensity-stratified insulin/carb adjustments
+    - Scott et al. 2021, Lancet D&E 9:304-17: post-exercise recovery protocol
+    - Zaharieva et al. 2020, PMID 33011134: closed-loop exercise strategies
+    - Boom et al. 2021, doi:10.1111/jdi.13356: IOB at walk-start risk
+    - Parent et al. 2024, doi:10.1016/j.diabres.2024.111631: IHE burst protection
+    """
+    if not activity_points:
+        return {}
+
+    walk_start = datetime.fromisoformat(activity_points[0]['timestamp_iso'])
+    walk_end   = datetime.fromisoformat(activity_points[-1]['timestamp_iso'])
+
+    all_bg: list[tuple[datetime, float]] = []
+    for p in bg_points_all:
+        try:
+            all_bg.append((datetime.fromisoformat(p['timestamp']), float(p['bg'])))
+        except (KeyError, ValueError, TypeError):
+            continue
+    all_bg.sort(key=lambda x: x[0])
+
+    def _nearest_bg(target: datetime, window_min: float = 20.0) -> float | None:
+        w = timedelta(minutes=window_min)
+        candidates = [(ts, bg) for ts, bg in all_bg if abs(ts - target) <= w]
+        return min(candidates, key=lambda x: abs(x[0] - target))[1] if candidates else None
+
+    bg_at_start = _nearest_bg(walk_start)
+    bg_at_end   = _nearest_bg(walk_end)
+
+    # N-02: First-30-min drop rate (Riddell 2017 / IHE 2024 — early descent is
+    # the primary predictor of whether an episode reaches hypo).
+    bg_at_30min = _nearest_bg(walk_start + timedelta(minutes=30), window_min=10.0)
+    first_30_drop_rate: float | None = None
+    rest_drop_rate: float | None = None
+    first_30_flag: str | None = None
+    if bg_at_start is not None and bg_at_30min is not None:
+        first_30_drop_rate = round((bg_at_30min - bg_at_start) / 0.5, 2)  # mmol/L/h
+        first_30_flag = 'rapid' if first_30_drop_rate < -2.0 else ('elevated' if first_30_drop_rate < -0.5 else 'normal')
+    # Rest-of-walk rate: bg_at_30min → bg_at_end
+    walk_duration_h = (walk_end - walk_start).total_seconds() / 3600.0
+    if bg_at_30min is not None and bg_at_end is not None and walk_duration_h > 0.5:
+        rest_h = walk_duration_h - 0.5
+        if rest_h > 0.1:
+            rest_drop_rate = round((bg_at_end - bg_at_30min) / rest_h, 2)
+
+    # N-03: IHE burst detection (Parent et al. 2024).
+    ihe_burst_count = _detect_ihe_bursts(activity_points)
+
+    # N-04: Post-exercise hyperglycaemia (Scott 2021) — BG 8–12 mmol/L at walk end.
+    post_exercise_hyper = (
+        bg_at_end is not None and 8.0 < bg_at_end <= 12.0
+    )
+
+    # N-06: Nocturnal risk window end time (Scott 2021 — 6–12 h; use 12 h ceiling).
+    risk_window_end_iso = (walk_end + timedelta(hours=12)).isoformat()
+
+    # IOB at walk-start: linear decay model over 4 h (same as insulin_stress_effect).
+    # Boom 2021: finishing a half-marathon safely required accounting for IOB before
+    # the bolus preceding activity. Flag if > 1 U remains at walk start.
+    iob_window_s = 4.0 * 3600.0
+    iob_at_start: float | None = None
+    iob_flag: str | None = None
+    if bolus_events_all:
+        ws_ts = walk_start.timestamp()
+        iob_sum = 0.0
+        for row in bolus_events_all:
+            try:
+                bolus_ts = datetime.fromisoformat(row['timestamp']).timestamp()
+                units = float(row['units'])
+            except (KeyError, ValueError, TypeError):
+                continue
+            elapsed = ws_ts - bolus_ts
+            if elapsed < 0 or elapsed > iob_window_s:
+                continue
+            iob_sum += units * max(1.0 - (elapsed / iob_window_s), 0.0)
+        iob_at_start = round(iob_sum, 2)
+        if iob_at_start >= 2.0:
+            iob_flag = 'high'
+        elif iob_at_start >= 1.0:
+            iob_flag = 'moderate'
+        else:
+            iob_flag = 'low'
+
+    # Intensity by avg HR: Riddell 2017 Table 3 stratification
+    avg_hr = metrics.get('avg_hr')
+    if avg_hr is not None and avg_hr >= 130:
+        intensity           = 'vigorous'
+        bolus_reduction_pct = 75
+        basal_reduction_pct = 80
+        carbs_per_hour_g    = 30
+    elif avg_hr is not None and avg_hr >= 110:
+        intensity           = 'moderate'
+        bolus_reduction_pct = 50
+        basal_reduction_pct = 65
+        carbs_per_hour_g    = 25
+    elif avg_hr is not None:
+        intensity           = 'light'
+        bolus_reduction_pct = 25
+        basal_reduction_pct = 50
+        carbs_per_hour_g    = 15
+    else:
+        intensity           = 'unknown'
+        bolus_reduction_pct = 50
+        basal_reduction_pct = 65
+        carbs_per_hour_g    = 20
+
+    # Pre-walk BG: Riddell 2017 target 7–10 mmol/L for moderate aerobic.
+    # E-01: Zaharieva 2020 Table 3 — closed-loop contraindication at > 15.0 mmol/L.
+    prewalk_target_min, prewalk_target_max = 7.0, 10.0
+    if bg_at_start is None:
+        prewalk_assessment = None
+    elif bg_at_start > 15.0:
+        prewalk_assessment = 'contraindicated_cl'
+    elif bg_at_start < prewalk_target_min:
+        prewalk_assessment = 'low'
+    elif bg_at_start <= prewalk_target_max:
+        prewalk_assessment = 'optimal'
+    else:
+        prewalk_assessment = 'high'
+
+    # Drop rate and forward hypo projection from walk-end BG at current rate
+    slope = metrics.get('bg_slope_during_h')
+    drop_flag = None
+    projected_hypo_min = None
+    if slope is not None:
+        if slope < -2.0:
+            drop_flag = 'rapid'
+        elif slope < -0.5:
+            drop_flag = 'elevated'
+        else:
+            drop_flag = 'normal'
+        if slope < 0 and bg_at_end is not None and bg_at_end > 3.9:
+            projected_hypo_min = round(((bg_at_end - 3.9) / abs(slope)) * 60.0)
+
+    # Overnight risk from 2–12 h recovery data
+    overnight_risk = 'low'
+    for phase in recovery_phases:
+        if phase['key'] in ('post_2_6h', 'post_6_12h'):
+            if phase.get('hypos', 0) > 0:
+                overnight_risk = 'confirmed'
+                break
+            s, m = phase.get('slope_per_hour'), phase.get('min_bg')
+            if (s is not None and s < -1.5) or (m is not None and m < 4.5):
+                overnight_risk = 'elevated'
+
+    # Scott 2021 early-recovery carb trigger: BG < 8.0 mmol/L in 0–2 h post
+    early = next((p for p in recovery_phases if p['key'] == 'post_0_2h'), {})
+    early_carb_trigger = (
+        early.get('min_bg') is not None
+        and early['min_bg'] < 8.0
+        and early.get('count', 0) > 0
+    )
+
+    duration_h    = metrics.get('duration_h') or 0.0
+    total_carbs_g = round(duration_h * carbs_per_hour_g)
+
+    return {
+        'prewalk': {
+            'bg_at_start':    bg_at_start,
+            'target_range':   [prewalk_target_min, prewalk_target_max],
+            'assessment':     prewalk_assessment,
+            'iob_at_start':   iob_at_start,
+            'iob_flag':       iob_flag,
+        },
+        'during': {
+            'intensity':              intensity,
+            'bg_at_end':              bg_at_end,
+            'drop_rate_mmol_h':       slope,
+            'drop_flag':              drop_flag,
+            'projected_hypo_min':     projected_hypo_min,
+            'first_30_drop_rate':     first_30_drop_rate,
+            'first_30_flag':          first_30_flag,
+            'rest_drop_rate':         rest_drop_rate,
+            'ihe_burst_count':        ihe_burst_count,
+            'post_exercise_hyper':    post_exercise_hyper,
+        },
+        'recovery': {
+            'early_carb_trigger_met': early_carb_trigger,
+            'overnight_risk':         overnight_risk,
+            'risk_window_end_iso':    risk_window_end_iso,
+        },
+        'nextWalk': {
+            'target_bg_range':            [prewalk_target_min, prewalk_target_max],
+            'intensity':                  intensity,
+            'basal_reduction_pct':        basal_reduction_pct,
+            'basal_timing_min':           90,    # Riddell: start 90 min before
+            'bolus_reduction_pct':        bolus_reduction_pct,
+            'carbs_per_hour_g':           carbs_per_hour_g,
+            'total_carbs_g':              total_carbs_g,
+            'recovery_bolus_reduction_pct': 35,  # Scott 2021: 20–50%
+            'recovery_basal_reduction_h': 9,     # Scott 2021: 6–12 h
+            # 780G SmartGuard: raise CL temp target to 8.3 mmol/L (150 mg/dL),
+            # start 90 min before activity, cancel when BG returns to normal range.
+            # Zaharieva 2020 (doi:10.1016/j.jcjd.2020.06.003), Boom 2021 (doi:10.1111/jdi.13356)
+            'cl_temp_target_mmol':        8.3,
+            'cl_temp_target_mgdl':        150,
+            'cl_temp_start_min_before':   90,
+        },
+    }
+
+
 def _stress_summary_for_walk_dir(walk_dir: Path) -> dict | None:
     fit_files = sorted(walk_dir.glob('*.fit'))
     if not fit_files:
@@ -2146,6 +2472,8 @@ def _get_walk_analysis_data(
 
     # Keep unfiltered basal samples so we can carry the last known rate into chart start.
     basal_points_all = list(basal_points)
+    # Keep full BG list for extended recovery and risk-profile analytics.
+    bg_points_all = list(bg_points)
 
     bg_points = _window_filter(bg_points, start_dt, end_dt, 'timestamp')
     basal_points = _window_filter(basal_points, start_dt, end_dt, 'timestamp')
@@ -2356,6 +2684,9 @@ def _get_walk_analysis_data(
                 })
 
     metrics = _summary_metrics(activity_points, bg_points, bolus_events)
+    sensor_gaps = _sensor_gap_detection(activity_points, bg_points_all)
+    recovery_phases = _extended_recovery_phases(activity_points, bg_points_all)
+    risk_profile = _exercise_risk_profile(activity_points, bg_points_all, metrics, recovery_phases, bolus_events_all)
     smartguard_summary = _smartguard_summary(activity_points, smartguard_events)
     weather_effort = _weather_effort_analytics(activity_points, weather_points, metrics.get('duration_h'))
     stress_analytics = _stress_decoupling_analytics(activity_points, weather_points)
@@ -2391,6 +2722,9 @@ def _get_walk_analysis_data(
         'bolus': bolus_events,
         'phaseAnalytics': _phase_glucose_analytics(activity_points, bg_points),
         'intensityAnalytics': _intensity_glucose_analytics(activity_points, bg_points),
+        'sensorGaps': sensor_gaps,
+        'recoveryPhases': recovery_phases,
+        'riskProfile': risk_profile,
         'smartguard': {
             'events': smartguard_events,
             'summary': smartguard_summary,
@@ -2499,6 +2833,7 @@ def walk_analysis_data(walk_id: str, request: Request, user: dict = Depends(_req
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
     walk_dir = _find_walk_dir(walk_id, data_root)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
+    settings = get_user_settings(user['sub'])
     result = {
         'walk_id': walk_id,
         'date': date,
@@ -2506,6 +2841,7 @@ def walk_analysis_data(walk_id: str, request: Request, user: dict = Depends(_req
         'payload': payload,
         'metrics': metrics,
         'files': files,
+        'user_settings': settings,
     }
     return _json_with_cache(result, request, public=False)
 
@@ -2514,13 +2850,14 @@ def walk_analysis_data(walk_id: str, request: Request, user: dict = Depends(_req
 def walk_analysis(walk_id: str, request: Request, user: dict = Depends(_require_user)):
     data_root = _user_data_dir(user['sub'])
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
-    # Backward-compatible alias for clients that used /analysis.
+    settings = get_user_settings(user['sub'])
     result = {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
         'payload': payload,
         'metrics': metrics,
+        'user_settings': settings,
     }
     return _json_with_cache(result, request, public=False)
 
@@ -2589,6 +2926,7 @@ def shared_walk_analysis_data(token: str, request: Request):
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
     walk_dir = _find_walk_dir(walk_id, data_root)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
+    settings = get_user_settings(owner_sub)
     result = {
         'walk_id': walk_id,
         'date': date,
@@ -2596,6 +2934,7 @@ def shared_walk_analysis_data(token: str, request: Request):
         'payload': payload,
         'metrics': metrics,
         'files': files,
+        'user_settings': settings,
         'shared': True,
     }
     return _json_with_cache(result, request, public=True)
@@ -2678,6 +3017,7 @@ def get_settings(user: dict = Depends(_require_user)):
     settings = get_user_settings(user['sub'])
     if settings is None:
         default_settings = {
+            "user_type": "non_diabetic",
             "insulin_type": "None",
             "pump_brand_model": None,
             "basal_rates": None,
@@ -2697,4 +3037,19 @@ def get_settings(user: dict = Depends(_require_user)):
 def update_settings(settings: dict, user: dict = Depends(_require_user)):
     upsert_user_settings(user['sub'], settings)
     return {"status": "ok"}
+
+
+@app.delete('/api/user/account')
+def delete_account(user: dict = Depends(_require_user)):
+    data_root = _user_data_dir(user['sub'])
+    walk_ids = []
+    if data_root.exists() and data_root.is_dir():
+        walk_ids = [walk_dir.name for walk_dir in _iter_walk_dirs(data_root)]
+    # Clear DB records
+    delete_user_data(user['sub'], walk_ids)
+    # Clear directory from disk
+    if data_root.exists() and data_root.is_dir():
+        shutil.rmtree(data_root, ignore_errors=True)
+    return {"status": "ok"}
+
 

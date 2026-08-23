@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 
 export const DEFAULT_USER_SETTINGS = {
+  user_type: 'non_diabetic',
   insulin_type: 'None',
   pump_brand_model: '',
   basal_rates: { default: 0.8, exercise: 0.5 },
@@ -137,11 +138,18 @@ function FieldRow({ label, hint, children }) {
   )
 }
 
-export default function UserSettings({ userSettings, onSave, isRegistration, onBack }) {
+export default function UserSettings({ userSettings, onSave, isRegistration, onBack, onDeleteAccount }) {
   const [form, setForm] = useState(() => {
     if (userSettings && userSettings.updated_at) {
+      let userType = userSettings.user_type
+      if (!userType) {
+        if (userSettings.insulin_type === 'Pump') userType = 'diabetic_pump'
+        else if (userSettings.insulin_type === 'MDI') userType = 'diabetic_mdi'
+        else userType = 'non_diabetic'
+      }
       // Pre-populate with backend data, filling missing defaults
       return {
+        user_type: userType,
         insulin_type: userSettings.insulin_type || 'None',
         pump_brand_model: userSettings.pump_brand_model || '',
         basal_rates: userSettings.basal_rates || { ...DEFAULT_USER_SETTINGS.basal_rates },
@@ -159,6 +167,23 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [saved, setSaved] = useState(false)
+
+  const [deletingAccount, setDeletingAccount] = useState(false)
+  const [deleteError, setDeleteError] = useState(null)
+
+  const handleDeleteAccount = async () => {
+    if (!window.confirm("Are you sure you want to permanently delete your account and all walk telemetry data? This action is irreversible.")) {
+      return
+    }
+    setDeletingAccount(true)
+    setDeleteError(null)
+    try {
+      await onDeleteAccount()
+    } catch (err) {
+      setDeleteError(err.message || 'Failed to delete account')
+      setDeletingAccount(false)
+    }
+  }
 
   const handleTemplateChange = (e) => {
     const name = e.target.value
@@ -238,16 +263,24 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
 
       <div className="card insulin-setup-card">
         {/* User Type / Diabetic Status */}
-        <FieldRow label="Diabetic Treatment Type" hint="Select your therapy profile">
+        <FieldRow label="User Profile Type" hint="Select your biometric and therapy profile">
           <select
             className="setup-text-input"
-            value={form.insulin_type}
-            onChange={(e) => updateRoot('insulin_type', e.target.value)}
-            style={{ maxWidth: '280px', padding: '0.45rem' }}
+            value={form.user_type}
+            onChange={(e) => {
+              const ut = e.target.value
+              let it = 'None'
+              if (ut === 'diabetic_pump') it = 'Pump'
+              else if (ut === 'diabetic_mdi') it = 'MDI'
+              setSaved(false)
+              setForm(prev => ({ ...prev, user_type: ut, insulin_type: it }))
+            }}
+            style={{ maxWidth: '320px', padding: '0.45rem' }}
           >
-            <option value="None">Non-diabetic / No insulin</option>
-            <option value="MDI">Multiple Daily Injections (MDI)</option>
-            <option value="Pump">Insulin Pump</option>
+            <option value="diabetic_pump">Diabetic with CGM (Pump Therapy)</option>
+            <option value="diabetic_mdi">Diabetic with CGM (Basal/Bolus)</option>
+            <option value="non_diabetic_cgm">Non-diabetic with CGM</option>
+            <option value="non_diabetic">Non-diabetic without CGM</option>
           </select>
         </FieldRow>
 
@@ -503,6 +536,25 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
           </button>
           {saved && <span className="msg-ok">Profile saved successfully.</span>}
         </div>
+
+        {/* Danger Zone */}
+        {!isRegistration && (
+          <div style={{ marginTop: '3rem', paddingTop: '2rem', borderTop: '1px solid rgba(190, 47, 47, 0.25)' }}>
+            <h3 style={{ color: '#be2f2f', fontSize: '1.05rem', fontWeight: 700, marginBottom: '0.5rem', textTransform: 'none', letterSpacing: 'normal' }}>Danger Zone</h3>
+            <p className="hint" style={{ marginBottom: '1.2rem', color: 'var(--text-muted)' }}>
+              Permanently delete your account, clinical configurations, and all uploaded walking/CGM telemetry data. This action is irreversible.
+            </p>
+            <button
+              className="btn-danger"
+              type="button"
+              onClick={handleDeleteAccount}
+              disabled={deletingAccount}
+            >
+              {deletingAccount ? 'Deleting Account...' : 'Delete My Account & Data'}
+            </button>
+            {deleteError && <p className="msg-error" style={{ marginTop: '0.75rem', color: '#be2f2f' }}>{deleteError}</p>}
+          </div>
+        )}
       </div>
     </div>
   )

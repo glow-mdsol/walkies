@@ -469,6 +469,19 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
   }, [effortHrReference, effortScaleMin, effortScaleMax, insulinModelMode])
 
   const metrics = data?.metrics || {}
+  const userSettings = data?.user_settings || {}
+  const userType = userSettings.user_type || (userSettings.insulin_type === 'Pump' ? 'diabetic_pump' : userSettings.insulin_type === 'MDI' ? 'diabetic_mdi' : 'non_diabetic')
+
+  const hasCGM = userType === 'diabetic_pump' || userType === 'diabetic_mdi' || userType === 'non_diabetic_cgm'
+  const hasInsulin = userType === 'diabetic_pump' || userType === 'diabetic_mdi'
+  const hasPump = userType === 'diabetic_pump'
+
+  useEffect(() => {
+    if (!hasCGM && analysisTab !== 'general') {
+      setAnalysisTab('general')
+    }
+  }, [hasCGM, analysisTab])
+
   const payload = data?.payload || {}
   const stressSummary = data?.payload?.stressAnalytics?.summary || {}
   const insulinStressSummary = data?.payload?.insulinStressEffect?.summary || {}
@@ -784,6 +797,9 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
 
   const phaseRows = useMemo(() => payload?.phaseAnalytics?.phases || [], [payload?.phaseAnalytics])
   const intensityRows = useMemo(() => payload?.intensityAnalytics || [], [payload?.intensityAnalytics])
+  const riskProfile = useMemo(() => payload?.riskProfile || null, [payload])
+  const recoveryPhases = useMemo(() => payload?.recoveryPhases || [], [payload])
+  const sensorGaps = useMemo(() => payload?.sensorGaps || [], [payload])
   const hasBgInsights = glucoseRows.length > 0
 
   const insightLines = useMemo(() => {
@@ -957,14 +973,16 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
         )}
       </section>
 
-      <div className="analysis-tabs home-tabs">
-        <button className={`home-tab ${analysisTab === 'general' ? 'home-tab--active' : ''}`} onClick={() => setAnalysisTab('general')} type="button">
-          General
-        </button>
-        <button className={`home-tab ${analysisTab === 'diabetes' ? 'home-tab--active' : ''}`} onClick={() => setAnalysisTab('diabetes')} type="button">
-          Diabetes
-        </button>
-      </div>
+      {hasCGM && (
+        <div className="analysis-tabs home-tabs">
+          <button className={`home-tab ${analysisTab === 'general' ? 'home-tab--active' : ''}`} onClick={() => setAnalysisTab('general')} type="button">
+            General
+          </button>
+          <button className={`home-tab ${analysisTab === 'diabetes' ? 'home-tab--active' : ''}`} onClick={() => setAnalysisTab('diabetes')} type="button">
+            {hasInsulin ? 'Diabetes' : 'Glucose'}
+          </button>
+        </div>
+      )}
 
       {analysisTab === 'general' ? (
         <>
@@ -1135,14 +1153,18 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
           <section className="analysis-stats-grid">
             <Stat label="BG Delta" value={fmt(metrics.bg_delta, 2, ' mmol/L')} />
             <Stat label="Time in range" value={fmt(metrics.tir_pct, 0, '%')} />
-            <Stat
-              label="Insulin stress"
-              value={`${fmt(insulinStressSummary.stress_multiplier, 2, 'x')}${insulinStressSummary.band ? ` (${insulinStressSummary.band})` : ''}`}
-            />
-            <Stat
-              label="SmartGuard"
-              value={smartguardSummary.any_activity ? `${fmt(smartguardSummary.predicted_low_suspend_count, 0)} predicted-low` : 'No events'}
-            />
+            {hasInsulin && (
+              <Stat
+                label="Insulin stress"
+                value={`${fmt(insulinStressSummary.stress_multiplier, 2, 'x')}${insulinStressSummary.band ? ` (${insulinStressSummary.band})` : ''}`}
+              />
+            )}
+            {hasPump && (
+              <Stat
+                label="SmartGuard"
+                value={smartguardSummary.any_activity ? `${fmt(smartguardSummary.predicted_low_suspend_count, 0)} predicted-low` : 'No events'}
+              />
+            )}
           </section>
 
           <ChartCard
@@ -1176,65 +1198,67 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             </ChartCard>
 
         <ChartCard
-          title="Glucose and Insulin"
-          description="Overlays glucose readings, basal insulin, recorded boluses, and estimated active bolus insulin across the route distance."
-          empty={!glucoseChartRows.length ? 'No BG/insulin points available.' : null}
+          title={hasInsulin ? "Glucose and Insulin" : "Glucose Trend"}
+          description={hasInsulin ? "Overlays glucose readings, basal insulin, recorded boluses, and estimated active bolus insulin across the route distance." : "Plots glucose readings across the route distance to help analyze fueling and metabolic response."}
+          empty={!glucoseChartRows.length ? (hasInsulin ? 'No BG/insulin points available.' : 'No glucose points available.') : null}
         >
-          <div className="insulin-controls-panel">
-            {insulinProfile && (
-              <div className="insulin-profile-badge">
-                <span className="insulin-profile-name">{insulinProfile.name}</span>
-                <span className="insulin-profile-detail">
-                  onset {insulinProfile.onsetMins} min · early action {insulinProfile.earlyActionMins} min ·
-                  peak {num(insulinProfile.peakMinHours, 1)}–{num(insulinProfile.peakMaxHours, 1)} h ·
-                  duration {num(insulinProfile.durationMinHours, 1)}–{num(insulinProfile.durationMaxHours, 1)} h
-                </span>
+          {hasInsulin && (
+            <div className="insulin-controls-panel">
+              {insulinProfile && (
+                <div className="insulin-profile-badge">
+                  <span className="insulin-profile-name">{insulinProfile.name}</span>
+                  <span className="insulin-profile-detail">
+                    onset {insulinProfile.onsetMins} min · early action {insulinProfile.earlyActionMins} min ·
+                    peak {num(insulinProfile.peakMinHours, 1)}–{num(insulinProfile.peakMaxHours, 1)} h ·
+                    duration {num(insulinProfile.durationMinHours, 1)}–{num(insulinProfile.durationMaxHours, 1)} h
+                  </span>
+                </div>
+              )}
+              <div className="insulin-decay-control">
+                <label>Insulin model: {insulinModelMode === INSULIN_MODEL_SMARTGUARD ? 'SmartGuard-adjusted' : 'Normal basal/bolus'}</label>
+                <button className="btn-secondary" type="button" onClick={() => setShowInsulinModelModal(true)}>Change model</button>
               </div>
-            )}
-            <div className="insulin-decay-control">
-              <label>Insulin model: {insulinModelMode === INSULIN_MODEL_SMARTGUARD ? 'SmartGuard-adjusted' : 'Normal basal/bolus'}</label>
-              <button className="btn-secondary" type="button" onClick={() => setShowInsulinModelModal(true)}>Change model</button>
+              <div className="insulin-decay-control">
+                <label htmlFor="effort-hr-reference-range">HR reference: {num(effortHrReference, 0)} bpm</label>
+                <input
+                  id="effort-hr-reference-range"
+                  type="range"
+                  min={EFFORT_HR_REFERENCE_MIN}
+                  max={EFFORT_HR_REFERENCE_MAX}
+                  step={5}
+                  value={effortHrReference}
+                  onChange={(e) => setEffortHrReference(Number(e.target.value))}
+                />
+              </div>
+              <div className="insulin-decay-control">
+                <label htmlFor="effort-scale-min-range">Effort floor: {num(effortScaleMin, 2)}x</label>
+                <input
+                  id="effort-scale-min-range"
+                  type="range"
+                  min={EFFORT_SCALE_MIN_MIN}
+                  max={Math.min(EFFORT_SCALE_MIN_MAX, effortScaleMax - 0.1)}
+                  step={0.05}
+                  value={effortScaleMin}
+                  onChange={(e) => setEffortScaleMin(Number(e.target.value))}
+                />
+              </div>
+              <div className="insulin-decay-control">
+                <label htmlFor="effort-scale-max-range">Effort ceiling: {num(effortScaleMax, 2)}x</label>
+                <input
+                  id="effort-scale-max-range"
+                  type="range"
+                  min={Math.max(EFFORT_SCALE_MAX_MIN, effortScaleMin + 0.1)}
+                  max={EFFORT_SCALE_MAX_MAX}
+                  step={0.05}
+                  value={effortScaleMax}
+                  onChange={(e) => setEffortScaleMax(Number(e.target.value))}
+                />
+              </div>
+              <p className="insulin-controls-note">These analytics controls are saved in this browser. Derived analytics remain computed from source data on demand.</p>
             </div>
-            <div className="insulin-decay-control">
-              <label htmlFor="effort-hr-reference-range">HR reference: {num(effortHrReference, 0)} bpm</label>
-              <input
-                id="effort-hr-reference-range"
-                type="range"
-                min={EFFORT_HR_REFERENCE_MIN}
-                max={EFFORT_HR_REFERENCE_MAX}
-                step={5}
-                value={effortHrReference}
-                onChange={(e) => setEffortHrReference(Number(e.target.value))}
-              />
-            </div>
-            <div className="insulin-decay-control">
-              <label htmlFor="effort-scale-min-range">Effort floor: {num(effortScaleMin, 2)}x</label>
-              <input
-                id="effort-scale-min-range"
-                type="range"
-                min={EFFORT_SCALE_MIN_MIN}
-                max={Math.min(EFFORT_SCALE_MIN_MAX, effortScaleMax - 0.1)}
-                step={0.05}
-                value={effortScaleMin}
-                onChange={(e) => setEffortScaleMin(Number(e.target.value))}
-              />
-            </div>
-            <div className="insulin-decay-control">
-              <label htmlFor="effort-scale-max-range">Effort ceiling: {num(effortScaleMax, 2)}x</label>
-              <input
-                id="effort-scale-max-range"
-                type="range"
-                min={Math.max(EFFORT_SCALE_MAX_MIN, effortScaleMin + 0.1)}
-                max={EFFORT_SCALE_MAX_MAX}
-                step={0.05}
-                value={effortScaleMax}
-                onChange={(e) => setEffortScaleMax(Number(e.target.value))}
-              />
-            </div>
-            <p className="insulin-controls-note">These analytics controls are saved in this browser. Derived analytics remain computed from source data on demand.</p>
-          </div>
+          )}
 
-          {!!smartguardMarkerRows.length && (
+          {hasPump && !!smartguardMarkerRows.length && (
             <div className="insulin-marker-legend" aria-label="SmartGuard markers">
               <span><i className="marker marker-predicted" />SmartGuard predicted-low suspend</span>
               <span><i className="marker marker-suspend" />SmartGuard suspend</span>
@@ -1290,7 +1314,9 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
               <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
               <YAxis yAxisId="bg" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" mmol/L" />
-              <YAxis yAxisId="ins" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} domain={[0, INSULIN_AXIS_MAX]} tickFormatter={(v) => num(v, 1)} unit=" U/h" />
+              {hasInsulin && (
+                <YAxis yAxisId="ins" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} domain={[0, INSULIN_AXIS_MAX]} tickFormatter={(v) => num(v, 1)} unit=" U/h" />
+              )}
               <Tooltip
                 labelFormatter={(v) => `${num(v, 2)} km`}
                 formatter={(value, name, item) => {
@@ -1307,7 +1333,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                 }}
               />
               <Legend />
-              {smartguardMarkerRows.map((row, idx) => {
+              {hasPump && smartguardMarkerRows.map((row, idx) => {
                 const state = row.state || 'other'
                 const stroke = state === 'predicted_low_suspend'
                   ? '#be2f2f'
@@ -1345,18 +1371,22 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                 )
               })}
               <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
-              <Area yAxisId="ins" type="stepAfter" dataKey="basal" name="Basal rate" stroke="#00745a" fill="rgba(0,116,90,0.22)" connectNulls strokeWidth={1.8} />
-              <Line yAxisId="ins" type="monotone" dataKey="bolus_decay" name="Bolus decay" stroke="#1f6feb" dot={false} strokeWidth={1.8} connectNulls />
-              <Bar
-                yAxisId="ins"
-                dataKey="bolus_display"
-                name="Bolus"
-                fill="#003f91"
-                stroke="#002f6b"
-                strokeWidth={1}
-                barSize={11}
-                shape={(props) => <BolusBarShape {...props} activeDistance={activeDistance} />}
-              />
+              {hasInsulin && (
+                <>
+                  <Area yAxisId="ins" type="stepAfter" dataKey="basal" name="Basal rate" stroke="#00745a" fill="rgba(0,116,90,0.22)" connectNulls strokeWidth={1.8} />
+                  <Line yAxisId="ins" type="monotone" dataKey="bolus_decay" name="Bolus decay" stroke="#1f6feb" dot={false} strokeWidth={1.8} connectNulls />
+                  <Bar
+                    yAxisId="ins"
+                    dataKey="bolus_display"
+                    name="Bolus"
+                    fill="#003f91"
+                    stroke="#002f6b"
+                    strokeWidth={1}
+                    barSize={11}
+                    shape={(props) => <BolusBarShape {...props} activeDistance={activeDistance} />}
+                  />
+                </>
+              )}
             </ComposedChart>
           </ResponsiveContainer>
         </ChartCard>
@@ -1494,6 +1524,20 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             <strong>{fmt(stressSummary.max_residual_bpm, 1, ' bpm')}</strong>
           </div>
         </section>
+      ) : !hasInsulin ? (
+        <section className="card">
+          <h2>Glucose Summary</h2>
+          <div className="analysis-summary-row">
+            <span>Time in target (4.0–8.0 mmol/L):</span>
+            <strong>{fmt(metrics.tir_pct, 0, '%')}</strong>
+          </div>
+          <div className="analysis-summary-row">
+            <span>Glucose change:</span>
+            <strong style={{ color: metrics.bg_delta < 0 ? '#1f8a5b' : metrics.bg_delta > 0 ? '#d16a00' : 'inherit' }}>
+              {metrics.bg_delta > 0 ? '+' : ''}{fmt(metrics.bg_delta, 1, ' mmol/L')}
+            </strong>
+          </div>
+        </section>
       ) : (
         <section className="card">
           <h2>Diabetes Summary</h2>
@@ -1509,13 +1553,314 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             <span>Peak IOB proxy:</span>
             <strong>{fmt(insulinStressSummary.peak_iob_units_proxy, 2, ' U')}</strong>
           </div>
-          <div className="analysis-summary-row">
-            <span>SmartGuard predicted-low suspend:</span>
-            <strong>{fmt(smartguardSummary.predicted_low_suspend_count, 0)}</strong>
+          {hasPump && (
+            <>
+              <div className="analysis-summary-row">
+                <span>SmartGuard predicted-low suspend:</span>
+                <strong>{fmt(smartguardSummary.predicted_low_suspend_count, 0)}</strong>
+              </div>
+              <div className="analysis-summary-row">
+                <span>SmartGuard suspend/resume:</span>
+                <strong>{fmt(smartguardSummary.suspend_count, 0)} / {fmt(smartguardSummary.resume_count, 0)}</strong>
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
+      {/* Glucose Risk Profile */}
+      <section className="card">
+        <h2>{hasInsulin ? "Glucose Risk Profile" : "Glucose Response"}</h2>
+        {riskProfile ? (
+          <>
+            <div className="analysis-summary-row">
+              <span>Pre-walk BG:</span>
+              {riskProfile.prewalk.bg_at_start != null ? (
+                hasInsulin ? (
+                  <strong style={{
+                    color: riskProfile.prewalk.assessment === 'optimal' ? '#1f8a5b'
+                      : riskProfile.prewalk.assessment === 'low' ? '#be2f2f'
+                      : riskProfile.prewalk.assessment === 'contraindicated_cl' ? '#be2f2f'
+                      : '#d16a00',
+                  }}>
+                    {fmt(riskProfile.prewalk.bg_at_start, 1)} mmol/L
+                    {' '}({riskProfile.prewalk.assessment === 'optimal' ? 'in target 7–10'
+                      : riskProfile.prewalk.assessment === 'low' ? 'below target — hypo risk elevated'
+                      : riskProfile.prewalk.assessment === 'contraindicated_cl' ? 'CL contraindication — delay walk until BG reduced'
+                      : 'above target'})
+                  </strong>
+                ) : (
+                  <strong>{fmt(riskProfile.prewalk.bg_at_start, 1)} mmol/L</strong>
+                )
+              ) : <strong>n/a</strong>}
+            </div>
+            {hasInsulin && riskProfile.prewalk.assessment === 'contraindicated_cl' && (
+              <div style={{ margin: '0.4rem 0 0.6rem', padding: '0.5rem 0.7rem', background: 'rgba(190,47,47,0.08)', borderRadius: '4px', borderLeft: '3px solid #be2f2f' }}>
+                <strong style={{ color: '#be2f2f' }}>Closed-loop contraindication</strong>
+                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>Do not start walk until BG is below 15.0 mmol/L. Significant hyperglycaemia is a hard stop for closed-loop exercise (Zaharieva et al. 2020, Table 3).</span>
+              </div>
+            )}
+            {hasInsulin && riskProfile.prewalk.iob_at_start != null && (
+              <div className="analysis-summary-row">
+                <span>IOB at walk start:</span>
+                <strong style={{
+                  color: riskProfile.prewalk.iob_flag === 'high'
+                    ? '#be2f2f'
+                    : riskProfile.prewalk.iob_flag === 'moderate'
+                      ? '#d16a00'
+                      : '#1f8a5b',
+                }}>
+                  {fmt(riskProfile.prewalk.iob_at_start, 1)} U
+                  {riskProfile.prewalk.iob_flag === 'high'
+                    ? ' — high, significant hypo risk during activity'
+                    : riskProfile.prewalk.iob_flag === 'moderate'
+                      ? ' — moderate, consider reducing bolus or taking carbs'
+                      : ' — low'}
+                </strong>
+              </div>
+            )}
+            <div className="analysis-summary-row">
+              <span>During-walk drop rate:</span>
+              {riskProfile.during.drop_rate_mmol_h != null ? (
+                hasInsulin ? (
+                  <strong style={{ color: riskProfile.during.drop_flag === 'rapid' ? '#be2f2f' : riskProfile.during.drop_flag === 'elevated' ? '#d16a00' : '#1f8a5b' }}>
+                    {fmt(riskProfile.during.drop_rate_mmol_h, 2)} mmol/L/h
+                    {riskProfile.during.drop_flag === 'rapid' ? ' — rapid, high hypo risk' : riskProfile.during.drop_flag === 'elevated' ? ' — elevated, monitor closely' : ' — within normal range'}
+                  </strong>
+                ) : (
+                  <strong>{fmt(riskProfile.during.drop_rate_mmol_h, 2)} mmol/L/h</strong>
+                )
+              ) : <strong>n/a</strong>}
+            </div>
+            {/* N-02: First-30-min drop rate breakdown */}
+            {hasInsulin && riskProfile.during.first_30_drop_rate != null && (
+              <div className="analysis-summary-row" style={{ paddingLeft: '1rem', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                <span>↳ First 30 min:</span>
+                <strong style={{ color: riskProfile.during.first_30_flag === 'rapid' ? '#be2f2f' : riskProfile.during.first_30_flag === 'elevated' ? '#d16a00' : 'inherit' }}>
+                  {fmt(riskProfile.during.first_30_drop_rate, 2)} mmol/L/h
+                  {riskProfile.during.first_30_flag === 'rapid' ? ' — rapid early descent' : ''}
+                </strong>
+                {riskProfile.during.rest_drop_rate != null && (
+                  <span style={{ marginLeft: '0.5rem', color: 'var(--text-muted)' }}>
+                    · rest: {fmt(riskProfile.during.rest_drop_rate, 2)} mmol/L/h
+                  </span>
+                )}
+              </div>
+            )}
+            {hasInsulin && riskProfile.during.projected_hypo_min != null && riskProfile.during.drop_flag !== 'normal' && (
+              <div className="analysis-summary-row">
+                <span>Projected hypo (3.9 mmol/L) from walk end:</span>
+                <strong style={{ color: '#be2f2f' }}>
+                  {riskProfile.during.projected_hypo_min < 60
+                    ? `${riskProfile.during.projected_hypo_min} min`
+                    : `${fmt(riskProfile.during.projected_hypo_min / 60, 1)} h`}
+                  {' '}at current rate
+                </strong>
+              </div>
+            )}
+            <div className="analysis-summary-row">
+              <span>Post-walk BG:</span>
+              <strong>{riskProfile.during.bg_at_end != null ? `${fmt(riskProfile.during.bg_at_end, 1)} mmol/L` : 'n/a'}</strong>
+            </div>
+            <div className="analysis-summary-row">
+              <span>Exercise intensity:</span>
+              <strong style={{ textTransform: 'capitalize' }}>{riskProfile.during.intensity}</strong>
+            </div>
+            {/* N-03: IHE burst detection */}
+            {riskProfile.during.ihe_burst_count > 0 && (
+              <div className="analysis-summary-row">
+                <span>High-intensity bursts (IHE):</span>
+                <strong style={{ color: '#1f8a5b' }}>
+                  {riskProfile.during.ihe_burst_count} burst{riskProfile.during.ihe_burst_count !== 1 ? 's' : ''} detected — associated with reduced glucose drop
+                </strong>
+              </div>
+            )}
+            {/* N-04: Post-exercise hyperglycaemia */}
+            {hasInsulin && riskProfile.during.post_exercise_hyper && (
+              <div style={{ marginTop: '0.6rem', padding: '0.5rem 0.7rem', background: 'rgba(209,106,0,0.08)', borderRadius: '4px', borderLeft: '3px solid #d16a00' }}>
+                <strong style={{ color: '#d16a00' }}>Mild post-exercise hyperglycaemia</strong>
+                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>
+                  BG {fmt(riskProfile.during.bg_at_end, 1)} mmol/L at walk end (8–12 mmol/L range). Consider a 10–15 min low-intensity cool-down to reduce BG gradually before stopping (Scott et al. 2021).
+                </span>
+              </div>
+            )}
+            {hasInsulin && riskProfile.recovery.early_carb_trigger_met && (
+              <div style={{ marginTop: '0.6rem', padding: '0.5rem 0.7rem', background: 'rgba(209,106,0,0.08)', borderRadius: '4px', borderLeft: '3px solid #d16a00' }}>
+                <strong style={{ color: '#d16a00' }}>Early-recovery carb trigger met</strong>
+                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>BG fell below 8.0 mmol/L within 2 h — carb intake recommended (Scott et al. 2021)</span>
+              </div>
+            )}
+            {sensorGaps.length > 0 && (
+              <div style={{ marginTop: '0.8rem' }}>
+                <p style={{ fontWeight: 600, color: '#d16a00', marginBottom: '0.3rem' }}>Sensor gaps during walk ({sensorGaps.length})</p>
+                <div className="trend-table-wrap">
+                  <table className="trend-table">
+                    <thead><tr><th>Start</th><th>End</th><th>Gap</th></tr></thead>
+                    <tbody>
+                      {sensorGaps.map((gap, i) => (
+                        <tr key={i}>
+                          <td>{new Date(gap.start).toLocaleTimeString()}</td>
+                          <td>{new Date(gap.end).toLocaleTimeString()}</td>
+                          <td>{fmt(gap.duration_min, 0)} min</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </>
+        ) : <p className="empty">No risk profile available — BG or activity data missing.</p>}
+      </section>
+
+      {/* Extended Recovery Monitor */}
+      <section className="card">
+        <h2>Recovery Monitor</h2>
+        {/* N-06: Nocturnal risk window end time */}
+        {hasInsulin && riskProfile?.recovery?.risk_window_end_iso && (
+          <div style={{ marginBottom: '0.7rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: '0.8rem', fontWeight: 600, background: 'rgba(190,47,47,0.1)', color: '#be2f2f', borderRadius: '4px', padding: '0.2rem 0.5rem' }}>
+              Elevated risk window closes {new Date(riskProfile.recovery.risk_window_end_iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {' '}({new Date(riskProfile.recovery.risk_window_end_iso).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })})
+            </span>
+            <span style={{ fontSize: '0.78rem', color: 'var(--text-muted)' }}>Scott et al. 2021 · Zaharieva et al. 2020</span>
           </div>
-          <div className="analysis-summary-row">
-            <span>SmartGuard suspend/resume:</span>
-            <strong>{fmt(smartguardSummary.suspend_count, 0)} / {fmt(smartguardSummary.resume_count, 0)}</strong>
+        )}
+        <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '0.8rem' }}>
+          {hasInsulin
+            ? "Nocturnal hypo risk persists 6–12 h after prolonged aerobic exercise (Scott et al. 2021, Lancet D&E 9:304–17)."
+            : "Plots glucose recovery patterns to monitor glycemic stability after the walk."}
+        </p>
+        {recoveryPhases.length > 0 ? (
+          <>
+            {hasInsulin && riskProfile?.recovery?.overnight_risk && riskProfile.recovery.overnight_risk !== 'low' && (
+              <div style={{ marginBottom: '0.7rem', padding: '0.5rem 0.7rem', background: riskProfile.recovery.overnight_risk === 'confirmed' ? 'rgba(190,47,47,0.08)' : 'rgba(209,106,0,0.08)', borderRadius: '4px', borderLeft: `3px solid ${riskProfile.recovery.overnight_risk === 'confirmed' ? '#be2f2f' : '#d16a00'}` }}>
+                <strong style={{ color: riskProfile.recovery.overnight_risk === 'confirmed' ? '#be2f2f' : '#d16a00' }}>
+                  {riskProfile.recovery.overnight_risk === 'confirmed'
+                    ? 'Hypo confirmed in post-walk recovery window'
+                    : 'Elevated overnight hypo risk detected'}
+                </strong>
+              </div>
+            )}
+            <div className="trend-table-wrap">
+              <table className="trend-table">
+                <thead>
+                  <tr>
+                    <th>Window</th>
+                    <th>Readings</th>
+                    <th>Min BG</th>
+                    <th>Mean BG</th>
+                    {hasInsulin && <th>Hypos</th>}
+                    <th>Slope / h</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recoveryPhases.map((phase) => (
+                    <tr key={phase.key} style={{ color: hasInsulin && phase.hypos > 0 ? '#be2f2f' : undefined }}>
+                      <td>{phase.label}</td>
+                      <td>{phase.count || '—'}</td>
+                      <td>{phase.min_bg != null ? `${fmt(phase.min_bg, 1)} mmol/L` : '—'}</td>
+                      <td>{phase.mean_bg != null ? `${fmt(phase.mean_bg, 1)} mmol/L` : '—'}</td>
+                      {hasInsulin && <td>{phase.hypos > 0 ? <strong style={{ color: '#be2f2f' }}>{phase.hypos}</strong> : (phase.count ? '0' : '—')}</td>}
+                      <td>{phase.slope_per_hour != null ? `${fmt(phase.slope_per_hour, 2)} mmol/L/h` : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : <p className="empty">No post-walk BG data in Carelink export for this period.</p>}
+      </section>
+
+      {/* Next Walk Preparation */}
+      {hasInsulin && riskProfile?.nextWalk && (
+        <section className="card">
+          <h2>Next Walk Preparation</h2>
+          <p style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginBottom: '1rem' }}>
+            Evidence-based guidance derived from this walk (Riddell et al. 2017, PMID 28126459; Scott et al. 2021; Zaharieva et al. 2020).
+          </p>
+          <div style={{ display: 'grid', gap: '1rem', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
+            <div style={{ padding: '0.9rem 1rem', background: 'rgba(31,138,91,0.06)', borderRadius: '6px', borderLeft: '3px solid #1f8a5b' }}>
+              <h3 style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '0.6rem', color: '#1f8a5b' }}>Before the walk</h3>
+              <ul style={{ paddingLeft: '1.2rem', fontSize: '0.87rem', lineHeight: 1.65, margin: 0 }}>
+                <li>Target BG <strong>{riskProfile.nextWalk.target_bg_range[0]}–{riskProfile.nextWalk.target_bg_range[1]} mmol/L</strong> at walk start</li>
+                <li>Reduce basal by <strong>{riskProfile.nextWalk.basal_reduction_pct}%</strong> starting <strong>{riskProfile.nextWalk.basal_timing_min} min</strong> before</li>
+                <li>If taking a pre-walk bolus, reduce by <strong>{riskProfile.nextWalk.bolus_reduction_pct}%</strong> (intensity: <em style={{ textTransform: 'capitalize' }}>{riskProfile.nextWalk.intensity}</em>)</li>
+                <li>Prepare ~<strong>{riskProfile.nextWalk.carbs_per_hour_g} g carbs/h</strong>{riskProfile.nextWalk.total_carbs_g ? ` (~${riskProfile.nextWalk.total_carbs_g} g total based on duration)` : ''}</li>
+              </ul>
+              {/* E-02: Riddell intensity-reduction reference table */}
+              <table style={{ marginTop: '0.8rem', width: '100%', fontSize: '0.8rem', borderCollapse: 'collapse' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                    <th style={{ textAlign: 'left', paddingBottom: '0.25rem', fontWeight: 600 }}>Intensity</th>
+                    <th style={{ textAlign: 'center', paddingBottom: '0.25rem', fontWeight: 600 }}>Bolus ↓</th>
+                    <th style={{ textAlign: 'center', paddingBottom: '0.25rem', fontWeight: 600 }}>Basal ↓</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    { label: 'Light', bolus: 25, basal: 50 },
+                    { label: 'Moderate', bolus: 50, basal: 65 },
+                    { label: 'Vigorous', bolus: 75, basal: 80 },
+                  ].map(({ label, bolus, basal }) => {
+                    const active = riskProfile.nextWalk.intensity?.toLowerCase() === label.toLowerCase()
+                    return (
+                      <tr key={label} style={{
+                        background: active ? 'rgba(31,138,91,0.12)' : 'transparent',
+                        fontWeight: active ? 700 : 400,
+                      }}>
+                        <td style={{ padding: '0.2rem 0.3rem' }}>{label}{active ? ' ★' : ''}</td>
+                        <td style={{ textAlign: 'center', padding: '0.2rem 0.3rem' }}>{bolus}%</td>
+                        <td style={{ textAlign: 'center', padding: '0.2rem 0.3rem' }}>{basal}%</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.4rem', marginBottom: 0 }}>
+                Riddell et al. 2017, Table 3
+              </p>
+            </div>
+            {riskProfile.nextWalk.cl_temp_target_mmol && (
+              <div style={{ padding: '0.9rem 1rem', background: 'rgba(8,114,184,0.06)', borderRadius: '6px', borderLeft: '3px solid #0872b8' }}>
+                <h3 style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '0.6rem', color: '#0872b8' }}>
+                  780G SmartGuard — temp target
+                </h3>
+                <ul style={{ paddingLeft: '1.2rem', fontSize: '0.87rem', lineHeight: 1.65, margin: 0 }}>
+                  <li>
+                    Raise CL target to{' '}
+                    <strong>{riskProfile.nextWalk.cl_temp_target_mmol} mmol/L ({riskProfile.nextWalk.cl_temp_target_mgdl} mg/dL)</strong>{' '}
+                    in SmartGuard settings
+                  </li>
+                  <li>
+                    Set <strong>{riskProfile.nextWalk.cl_temp_start_min_before} min before</strong> starting activity
+                  </li>
+                  <li>
+                    Cancel when BG returns to your normal range (<strong>≤ {riskProfile.nextWalk.target_bg_range[1]} mmol/L</strong>) after the walk
+                  </li>
+                </ul>
+                <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.6rem', marginBottom: 0 }}>
+                  Zaharieva et al. 2020 · Boom et al. 2021
+                </p>
+              </div>
+            )}
+            <div style={{ padding: '0.9rem 1rem', background: 'rgba(10,143,143,0.06)', borderRadius: '6px', borderLeft: '3px solid #0a8f8f' }}>
+              <h3 style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '0.6rem', color: '#0a8f8f' }}>After the walk</h3>
+              <ul style={{ paddingLeft: '1.2rem', fontSize: '0.87rem', lineHeight: 1.65, margin: 0 }}>
+                <li>Check BG immediately and every <strong>15 min</strong> for first hour</li>
+                <li>
+                  If BG &lt; 8.0 mmol/L: take <strong>15–20 g fast carbs</strong>{' '}
+                  <span style={{ fontWeight: 400 }}>(mixed glucose + fructose — sports drink or fruit — restores liver glycogen faster than pure glucose for the same gram count; Scott et al. 2021)</span>
+                </li>
+                <li>Reduce bolus at first recovery meal by ~<strong>{riskProfile.nextWalk.recovery_bolus_reduction_pct}%</strong></li>
+                <li>Reduce basal by <strong>20%</strong> for <strong>{riskProfile.nextWalk.recovery_basal_reduction_h} h</strong> post-walk</li>
+                {/* E-02: bedtime snack guidance for light-to-moderate intensity (Riddell 2017 Table 3) */}
+                {(riskProfile.nextWalk.intensity === 'light' || riskProfile.nextWalk.intensity === 'moderate') && (
+                  <li>Bedtime snack of <strong>~0.4 g carbs/kg</strong> body weight to reduce nocturnal hypo risk (Riddell et al. 2017)</li>
+                )}
+                <li>Set CGM <strong>low alarm</strong> overnight</li>
+              </ul>
+            </div>
           </div>
         </section>
       )}

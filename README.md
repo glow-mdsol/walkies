@@ -88,7 +88,9 @@ walkies/
 ├── frontend/
 │   ├── package.json
 │   └── src/
+├── .env.example
 ├── Taskfile.yml
+├── personas.md
 └── README.md
 ```
 
@@ -183,19 +185,17 @@ That starts:
 
 The compose stack keeps uploaded walk files and the Postgres data directory in Docker volumes. If you want to override the database connection, set `ANALYTICS_DB_URL` in `.env` before starting the stack.
 
-### Authentication Configuration
+### Environment & Authentication Configuration
 
-Walkies uses Google sign-in and backend token verification. For local development, these variables are configured in a single `.env` file in the project root (which is automatically loaded for both backend and frontend dev tasks):
+Walkies uses Google sign-in and backend token verification. For local development, these variables are configured in a single `.env` file in the project root (which is automatically loaded for both backend and frontend dev tasks).
 
-Root `.env` configuration:
+To configure the application, copy the template from `.env.example` in the project root:
 
 ```bash
-GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
-VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id.apps.googleusercontent.com
-
-# Optional dev-only bypass (never enable in production)
-WALKIES_DEV_BYPASS_AUTH=1
+cp .env.example .env
 ```
+
+Review and adjust the documented variables in `.env` as needed. The typical root configuration includes:
 
 Analytics DB backend (optional, defaults to local sqlite file):
 

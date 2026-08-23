@@ -12,3 +12,14 @@ dependencies = [
     "pytest>=8.0.0",
     "httpx>=0.27.0",
 ]
+
+[dependency-groups]
+# Tooling for extracting, summarising and compacting the reference PDFs in
+# ../sources into a reviewable digest (see `sources_review` / `task sources:digest`).
+# Not needed to run the web app. The `anthropic` SDK is only used by the optional
+# `--llm` enrichment path and is imported lazily, so the heuristic digest still
+# works if it is absent.
+sources = [
+    "pypdf>=5.0.0",
+    "anthropic>=0.40.0",
+]

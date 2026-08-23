@@ -29,3 +29,6 @@ client_secret*.json
 sources/*.pdf
 # Generated digest contains verbatim extracts from the (copyrighted) source PDFs
 sources/DIGEST.md
+
+# Layout / temporary logs
+results.txt

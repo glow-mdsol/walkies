@@ -58,6 +58,7 @@ def test_db_settings_pump():
     
     assert retrieved is not None
     assert retrieved["user_sub"] == user_sub
+    assert retrieved["user_type"] == "diabetic_pump"
     assert retrieved["insulin_type"] == "Pump"
     assert retrieved["pump_brand_model"] == "Medtronic 780G"
     assert retrieved["basal_rates"] == {"default": 0.95, "exercise": 0.60}
@@ -90,6 +91,7 @@ def test_db_settings_mdi():
     
     assert retrieved is not None
     assert retrieved["user_sub"] == user_sub
+    assert retrieved["user_type"] == "diabetic_mdi"
     assert retrieved["insulin_type"] == "MDI"
     assert retrieved["pump_brand_model"] is None
     assert retrieved["basal_rates"] is None
@@ -119,6 +121,7 @@ def test_db_settings_none_diabetic():
     
     assert retrieved is not None
     assert retrieved["user_sub"] == user_sub
+    assert retrieved["user_type"] == "non_diabetic"
     assert retrieved["insulin_type"] == "None"
     # All other insulin-specific fields must be forced to None/NULL
     assert retrieved["pump_brand_model"] is None
@@ -129,6 +132,35 @@ def test_db_settings_none_diabetic():
     assert retrieved["exercise_correction_factor"] is None
     assert retrieved["iob_calculation_method"] is None
     assert retrieved["insulin_profile"] is None
+
+
+def test_db_settings_explicit_user_types():
+    user_sub = "test-explicit-types"
+    
+    # 1. diabetic_pump
+    upsert_user_settings(user_sub, {"user_type": "diabetic_pump", "pump_brand_model": "Omnipod 5"})
+    r1 = get_user_settings(user_sub)
+    assert r1["user_type"] == "diabetic_pump"
+    assert r1["insulin_type"] == "Pump"
+    assert r1["pump_brand_model"] == "Omnipod 5"
+    
+    # 2. diabetic_mdi
+    upsert_user_settings(user_sub, {"user_type": "diabetic_mdi"})
+    r2 = get_user_settings(user_sub)
+    assert r2["user_type"] == "diabetic_mdi"
+    assert r2["insulin_type"] == "MDI"
+    
+    # 3. non_diabetic_cgm
+    upsert_user_settings(user_sub, {"user_type": "non_diabetic_cgm"})
+    r3 = get_user_settings(user_sub)
+    assert r3["user_type"] == "non_diabetic_cgm"
+    assert r3["insulin_type"] == "None"
+    
+    # 4. non_diabetic
+    upsert_user_settings(user_sub, {"user_type": "non_diabetic"})
+    r4 = get_user_settings(user_sub)
+    assert r4["user_type"] == "non_diabetic"
+    assert r4["insulin_type"] == "None"
 
 
 def test_api_endpoints():

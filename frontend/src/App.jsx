@@ -5,6 +5,7 @@ import WalkList from './components/WalkList'
 import WalkAnalysisView from './components/WalkAnalysisView'
 import UserSettings from './components/UserSettings'
 import RouteCompare from './components/RouteCompare'
+import PersonasSection from './components/PersonasSection'
 
 const AUTH_TOKEN_KEY = 'walkies.google.idToken'
 const GOOGLE_CLIENT_ID_CONFIGURED = Boolean(import.meta.env.VITE_GOOGLE_CLIENT_ID)
@@ -131,6 +132,17 @@ export default function App() {
     setShowSettings(false)
   }
 
+  const handleDeleteAccount = async () => {
+    const res = await apiFetch('/api/user/account', {
+      method: 'DELETE',
+    })
+    if (!res.ok) {
+      const payload = await res.json().catch(() => ({}))
+      throw new Error(payload.detail || 'Failed to delete account')
+    }
+    handleLogout()
+  }
+
   const isSettingsLoading = idToken && !userSettings
   const isRegistrationRequired = idToken && userSettings && userSettings.updated_at === null
 
@@ -203,8 +215,8 @@ export default function App() {
             apiFetch={null}
           />
         ) : !idToken ? (
-          <div style={{ maxWidth: '640px', margin: '2rem auto', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
-            <section className="card" style={{ textAlign: 'center', padding: '2.5rem 2rem', background: 'linear-gradient(180deg, var(--surface) 0%, var(--surface-tint) 100%)' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+          <section className="card" style={{ textAlign: 'center', padding: '2.5rem 2rem', background: 'linear-gradient(180deg, var(--surface) 0%, var(--surface-tint) 100%)', maxWidth: '640px', margin: '0 auto', width: '100%' }}>
               <h2 style={{ fontSize: '1.8rem', fontWeight: 800, color: 'var(--primary)', textTransform: 'none', letterSpacing: 'normal', marginBottom: '0.75rem' }}>
                 Trek GM
               </h2>
@@ -270,6 +282,7 @@ export default function App() {
                 </div>
               </div>
             </section>
+            <PersonasSection />
           </div>
         ) : isSettingsLoading ? (
           <div style={{ textAlign: 'center', margin: '3rem auto', color: 'var(--text-muted)' }}>
@@ -287,6 +300,7 @@ export default function App() {
             onSave={handleSaveSettings}
             isRegistration={false}
             onBack={() => setShowSettings(false)}
+            onDeleteAccount={handleDeleteAccount}
           />
         ) : showRouteCompare ? (
           <RouteCompare

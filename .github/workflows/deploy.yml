@@ -96,5 +96,18 @@ jobs:
       - name: Deploy Frontend to Firebase Hosting
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
+          GCP_REGION: ${{ secrets.GCP_REGION }}
         run: |
+          node -e "
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('firebase.json', 'utf8'));
+            if (config.hosting && config.hosting.rewrites) {
+              config.hosting.rewrites.forEach(r => {
+                if (r.run) {
+                  r.run.region = process.env.GCP_REGION || 'us-central1';
+                }
+              });
+            }
+            fs.writeFileSync('firebase.json', JSON.stringify(config, null, 2));
+          "
           firebase deploy --only hosting --project ${{ secrets.GCP_PROJECT_ID }}
