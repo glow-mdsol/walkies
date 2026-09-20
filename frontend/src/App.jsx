@@ -31,6 +31,8 @@ export default function App() {
   const [showRouteCompare, setShowRouteCompare] = useState(false)
   const [userSettings, setUserSettings] = useState(null)
   const [homeTab, setHomeTab] = useState('walks')
+  const [syncingGarmin, setSyncingGarmin] = useState(false)
+  const [syncingCarelink, setSyncingCarelink] = useState(false)
   const [shareToken, setShareToken] = useState(() => {
     const params = new URLSearchParams(window.location.search)
     return params.get('share') || null
@@ -44,6 +46,50 @@ export default function App() {
     }
     return fetch(url, { ...options, headers })
   }, [idToken])
+
+  const handleGarminSync = async () => {
+    setSyncingGarmin(true)
+    setError(null)
+    try {
+      const res = await apiFetch('/api/garmin/sync', { method: 'POST' })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(payload.detail || 'Sync failed')
+
+      const count = payload.imported?.length ?? 0
+      if (count > 0) {
+        alert(`Successfully synced and imported ${count} new walk(s) from Garmin!`)
+        fetchWalks()
+      } else {
+        alert('All Garmin activities are already up-to-date.')
+      }
+    } catch (err) {
+      setError(err.message || 'Sync failed')
+    } finally {
+      setSyncingGarmin(false)
+    }
+  }
+
+  const handleCarelinkSync = async () => {
+    setSyncingCarelink(true)
+    setError(null)
+    try {
+      const res = await apiFetch('/api/carelink/sync', { method: 'POST' })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(payload.detail || 'Sync failed')
+
+      const count = payload.synced_walks?.length ?? 0
+      if (count > 0) {
+        alert(`Successfully synced and updated glucose overlay for ${count} walk(s) from CareLink!`)
+        fetchWalks()
+      } else {
+        alert('All Garmin walks are already up-to-date with CareLink glucose data.')
+      }
+    } catch (err) {
+      setError(err.message || 'Sync failed')
+    } finally {
+      setSyncingCarelink(false)
+    }
+  }
 
   const fetchSettings = useCallback(() => {
     if (!idToken) {
@@ -164,7 +210,7 @@ export default function App() {
       label: currentWalk?.name || currentWalk?.date || '',
     }
     if (showRouteCompare) return { back: () => setShowRouteCompare(false), label: 'Routes' }
-    if (showSettings) return { back: () => setShowSettings(false), label: 'Settings' }
+    if (showSettings) return { back: () => { setShowSettings(false); fetchSettings() }, label: 'Settings' }
     return null
   })()
 
@@ -293,6 +339,7 @@ export default function App() {
             userSettings={userSettings}
             onSave={handleSaveSettings}
             isRegistration={true}
+            apiFetch={apiFetch}
           />
         ) : showSettings ? (
           <UserSettings
@@ -301,6 +348,7 @@ export default function App() {
             isRegistration={false}
             onBack={() => setShowSettings(false)}
             onDeleteAccount={handleDeleteAccount}
+            apiFetch={apiFetch}
           />
         ) : showRouteCompare ? (
           <RouteCompare
@@ -312,6 +360,7 @@ export default function App() {
             walkId={selectedWalkId}
             insulinProfile={userSettings?.insulin_profile}
             apiFetch={apiFetch}
+            onRenamed={fetchWalks}
           />
         ) : (
           <>
@@ -334,9 +383,39 @@ export default function App() {
                 New Walk
               </button>
             </div>
+            {homeTab === 'walks' && userSettings?.garmin_email && (
+              <section className="card" style={{ padding: '0.75rem 1rem', marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.95rem', color: 'var(--text-muted)' }}>
+                  Connected to Garmin: <strong>{userSettings.garmin_email}</strong>
+                </span>
+                <button
+                  className="btn-primary"
+                  onClick={handleGarminSync}
+                  disabled={syncingGarmin}
+                  style={{ padding: '0.45rem 1rem', fontSize: '0.85rem' }}
+                >
+                  {syncingGarmin ? 'Syncing...' : '🔄 Sync Garmin Walks'}
+                </button>
+              </section>
+            )}
+            {homeTab === 'walks' && userSettings?.carelink_email && (
+              <section className="card" style={{ padding: '0.75rem 1rem', marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontSize: '0.95rem', color: 'var(--text-muted)' }}>
+                  Connected to CareLink: <strong>{userSettings.carelink_email}</strong>
+                </span>
+                <button
+                  className="btn-primary"
+                  onClick={handleCarelinkSync}
+                  disabled={syncingCarelink}
+                  style={{ padding: '0.45rem 1rem', fontSize: '0.85rem' }}
+                >
+                  {syncingCarelink ? 'Syncing...' : '🔄 Sync CareLink Glucose'}
+                </button>
+              </section>
+            )}
             {homeTab === 'walks'
               ? <WalkList walks={walks} onDeleted={fetchWalks} onView={setSelectedWalkId} apiFetch={apiFetch} />
-              : <UploadForm onUploaded={() => { fetchWalks(); setHomeTab('walks') }} apiFetch={apiFetch} />
+              : <UploadForm onUploaded={() => { fetchWalks(); setHomeTab('walks') }} apiFetch={apiFetch} garminEmail={userSettings?.garmin_email} />
             }
           </>
         )}
