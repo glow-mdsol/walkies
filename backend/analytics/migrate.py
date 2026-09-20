@@ -1,5 +1,7 @@
 import argparse
+import json
 import sqlite3
+import uuid
 from pathlib import Path
 
 from .db import (
@@ -10,7 +12,97 @@ from .db import (
     upsert_walk_analytics,
     upsert_walk_sources,
     upsert_user_settings,
+    update_walk_id_references,
 )
+
+
+def is_valid_uuid(val: str) -> bool:
+    try:
+        uuid.UUID(str(val))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _find_leaf_walk_dirs(root: Path) -> list[Path]:
+    """Find all walk directories (directories that directly contain walk files or meta.json)."""
+    walk_dirs: list[Path] = []
+    if not root.exists() or not root.is_dir():
+        return walk_dirs
+
+    for item in root.rglob("meta.json"):
+        if item.is_file():
+            walk_dirs.append(item.parent)
+
+    # Also check directories containing .fit or .csv files without a meta.json
+    for fit_file in root.rglob("*.fit"):
+        parent = fit_file.parent
+        if parent not in walk_dirs:
+            walk_dirs.append(parent)
+
+    return sorted(list(set(walk_dirs)), key=lambda p: str(p))
+
+
+def migrate_walk_ids_to_uuids(data_root: Path | None = None) -> dict:
+    """
+    Migrates all existing walk directories and database records from legacy slug names
+    to UUIDs. Preserves legacy IDs in meta.json.
+    """
+    if data_root is None:
+        data_root = Path(__file__).resolve().parent.parent / "data"
+
+    init_analytics_db()
+    leaf_dirs = _find_leaf_walk_dirs(data_root)
+    migrations = []
+
+    for walk_dir in leaf_dirs:
+        dir_name = walk_dir.name
+        meta_file = walk_dir / "meta.json"
+        meta = {}
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+            except Exception:
+                meta = {}
+
+        current_id = meta.get("id") or dir_name
+
+        # If already a valid UUID and directory name matches, ensure metadata consistency
+        if is_valid_uuid(dir_name):
+            if meta and meta.get("id") != dir_name:
+                meta["id"] = dir_name
+                meta_file.write_text(json.dumps(meta), encoding="utf-8")
+            continue
+
+        # Non-UUID walk identified: assign new UUID
+        new_uuid = str(uuid.uuid4())
+        old_id = dir_name
+        old_meta_id = meta.get("id") or old_id
+
+        meta["id"] = new_uuid
+        meta["legacy_id"] = old_meta_id
+
+        target_dir = walk_dir.parent / new_uuid
+        walk_dir.rename(target_dir)
+
+        target_meta_file = target_dir / "meta.json"
+        target_meta_file.write_text(json.dumps(meta), encoding="utf-8")
+
+        # Update database references atomically
+        update_walk_id_references(old_id, new_uuid)
+        if old_meta_id != old_id:
+            update_walk_id_references(old_meta_id, new_uuid)
+
+        migrations.append({
+            "old_id": old_id,
+            "new_id": new_uuid,
+            "path": str(target_dir),
+        })
+
+    return {
+        "migrated_walks": len(migrations),
+        "migrations": migrations,
+    }
 
 
 def read_source_rows(source_path: Path) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
@@ -86,19 +178,15 @@ def migrate_from_sqlite(source_path: Path) -> dict:
         metrics = row['metrics_json']
         summary = row['summary_json']
         if isinstance(metrics, str):
-            import json
             metrics = json.loads(metrics)
         if isinstance(summary, str):
-            import json
             summary = json.loads(summary)
 
         route_fingerprint = row.get('route_fingerprint_json')
         route_series = row.get('route_series_json')
         if isinstance(route_fingerprint, str) and route_fingerprint:
-            import json
             route_fingerprint = json.loads(route_fingerprint)
         if isinstance(route_series, str) and route_series:
-            import json
             route_series = json.loads(route_series)
 
         upsert_walk_analytics(
@@ -127,7 +215,6 @@ def migrate_from_sqlite(source_path: Path) -> dict:
         )
 
     for row in user_settings:
-        import json
         basal_rates = json.loads(row['basal_rates_json']) if row.get('basal_rates_json') else None
         carb_ratios = json.loads(row['carb_ratios_json']) if row.get('carb_ratios_json') else None
         insulin_profile = json.loads(row['insulin_profile_json']) if row.get('insulin_profile_json') else None
@@ -158,13 +245,31 @@ def migrate_from_sqlite(source_path: Path) -> dict:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='Migrate analytics data from a legacy sqlite file into the configured analytics backend.')
+    parser = argparse.ArgumentParser(description='Analytics migration tool')
     parser.add_argument(
         '--source',
         default=str(ANALYTICS_DB_PATH),
         help='Path to the source sqlite file. Defaults to backend/analytics.sqlite3',
     )
+    parser.add_argument(
+        '--migrate-walk-uuids',
+        action='store_true',
+        help='Migrate all existing walk directories and database records to UUIDs',
+    )
+    parser.add_argument(
+        '--data-dir',
+        default=None,
+        help='Path to the data directory to migrate walk UUIDs',
+    )
     args = parser.parse_args()
+
+    if args.migrate_walk_uuids:
+        data_root = Path(args.data_dir).resolve() if args.data_dir else None
+        res = migrate_walk_ids_to_uuids(data_root)
+        print(f"Migrated {res['migrated_walks']} walk(s) to UUIDs.")
+        for item in res['migrations']:
+            print(f"  {item['old_id']} -> {item['new_id']}")
+        return 0
 
     result = migrate_from_sqlite(Path(args.source).resolve())
     print(
@@ -181,3 +286,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+

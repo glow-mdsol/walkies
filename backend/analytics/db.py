@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import build_analytics_adapter
@@ -45,7 +46,8 @@ def init_analytics_db() -> None:
                 metrics_json TEXT NOT NULL,
                 summary_json TEXT NOT NULL,
                 route_fingerprint_json TEXT,
-                route_series_json TEXT
+                route_series_json TEXT,
+                rating INTEGER DEFAULT 3
             );
 
             CREATE INDEX IF NOT EXISTS idx_walk_analytics_order
@@ -75,14 +77,45 @@ def init_analytics_db() -> None:
                 exercise_correction_factor REAL,
                 iob_calculation_method TEXT,
                 insulin_profile_json TEXT,
+                garmin_email TEXT,
+                carelink_email TEXT,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS system_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                level TEXT NOT NULL,
+                category TEXT NOT NULL,
+                service TEXT,
+                message TEXT NOT NULL,
+                details TEXT,
+                user_sub TEXT,
+                is_auth_issue INTEGER DEFAULT 0,
+                is_connection_issue INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_system_logs_ts
+                ON system_logs(timestamp DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_system_logs_cat
+                ON system_logs(category, timestamp DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_system_logs_auth
+                ON system_logs(is_auth_issue, timestamp DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_system_logs_conn
+                ON system_logs(is_connection_issue, timestamp DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_system_logs_user
+                ON system_logs(user_sub, timestamp DESC);
             """
         )
         # Idempotent migrations for older DB files that predate these columns.
         for col, typedef in [
             ("route_fingerprint_json", "TEXT"),
             ("route_series_json", "TEXT"),
+            ("rating", "INTEGER DEFAULT 3"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE walk_analytics ADD COLUMN {col} {typedef}")
@@ -90,6 +123,14 @@ def init_analytics_db() -> None:
                 pass  # column already exists
         try:
             conn.execute("ALTER TABLE user_settings ADD COLUMN user_type TEXT")
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE user_settings ADD COLUMN garmin_email TEXT")
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute("ALTER TABLE user_settings ADD COLUMN carelink_email TEXT")
         except Exception:
             pass  # column already exists
 
@@ -129,15 +170,16 @@ def upsert_walk_analytics(
         conn.execute(
             """
             INSERT INTO walk_analytics (
-                walk_id, walk_date, walk_name, start_time, source_hash, analytics_version, computed_at,
+                walk_id, walk_date, walk_name, rating, start_time, source_hash, analytics_version, computed_at,
                 distance_km, duration_h, avg_hr, bg_delta, tir_pct, bolus_units,
                 weather_stress_score, hr_decoupling_score, metrics_json, summary_json,
                 route_fingerprint_json, route_series_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(walk_id) DO UPDATE SET
                 walk_date = excluded.walk_date,
                 walk_name = excluded.walk_name,
+                rating = excluded.rating,
                 start_time = excluded.start_time,
                 source_hash = excluded.source_hash,
                 analytics_version = excluded.analytics_version,
@@ -159,6 +201,7 @@ def upsert_walk_analytics(
                 walk_meta["id"],
                 walk_meta["date"],
                 walk_meta.get("name") or None,
+                walk_meta.get("rating", 3),
                 walk_meta.get("start_time"),
                 source_hash,
                 ANALYTICS_VERSION,
@@ -186,10 +229,12 @@ def delete_walk_analytics(walk_id: str) -> None:
 
 
 def analytics_row_to_dict(row) -> dict:
+    row_dict = dict(row)
     return {
         "walk_id": row["walk_id"],
         "date": row["walk_date"],
         "name": row["walk_name"],
+        "rating": row_dict.get("rating", 3),
         "start_time": row["start_time"],
         "source_hash": row["source_hash"],
         "analytics_version": row["analytics_version"],
@@ -304,7 +349,7 @@ def get_user_settings(user_sub: str) -> dict | None:
             """
             SELECT user_sub, user_type, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
                    insulin_sensitivity_factor, correction_threshold, exercise_correction_factor,
-                   iob_calculation_method, insulin_profile_json, updated_at
+                   iob_calculation_method, insulin_profile_json, garmin_email, carelink_email, updated_at
             FROM user_settings
             WHERE user_sub = ?
             """,
@@ -371,15 +416,27 @@ def upsert_user_settings(user_sub: str, settings: dict) -> None:
 
     updated_at = datetime.now(timezone.utc).isoformat()
     
+    if "garmin_email" in settings:
+        garmin_email = settings["garmin_email"]
+    else:
+        existing = get_user_settings(user_sub)
+        garmin_email = existing.get("garmin_email") if existing else None
+
+    if "carelink_email" in settings:
+        carelink_email = settings["carelink_email"]
+    else:
+        existing = get_user_settings(user_sub)
+        carelink_email = existing.get("carelink_email") if existing else None
+
     with analytics_conn() as conn:
         conn.execute(
             """
             INSERT INTO user_settings (
                 user_sub, user_type, insulin_type, pump_brand_model, basal_rates_json, carb_ratios_json,
                 insulin_sensitivity_factor, correction_threshold, exercise_correction_factor,
-                iob_calculation_method, insulin_profile_json, updated_at
+                iob_calculation_method, insulin_profile_json, garmin_email, carelink_email, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_sub) DO UPDATE SET
                 user_type = excluded.user_type,
                 insulin_type = excluded.insulin_type,
@@ -391,6 +448,8 @@ def upsert_user_settings(user_sub: str, settings: dict) -> None:
                 exercise_correction_factor = excluded.exercise_correction_factor,
                 iob_calculation_method = excluded.iob_calculation_method,
                 insulin_profile_json = excluded.insulin_profile_json,
+                garmin_email = excluded.garmin_email,
+                carelink_email = excluded.carelink_email,
                 updated_at = excluded.updated_at
             """,
             (
@@ -405,6 +464,8 @@ def upsert_user_settings(user_sub: str, settings: dict) -> None:
                 exercise_correction_factor,
                 iob_calculation_method,
                 insulin_profile_json,
+                garmin_email,
+                carelink_email,
                 updated_at,
             )
         )
@@ -414,6 +475,194 @@ def delete_user_data(user_sub: str, walk_ids: list[str]) -> None:
     with analytics_conn() as conn:
         conn.execute("DELETE FROM user_settings WHERE user_sub = ?", (user_sub,))
         conn.execute("DELETE FROM share_links WHERE owner_sub = ?", (user_sub,))
+        conn.execute("DELETE FROM system_logs WHERE user_sub = ?", (user_sub,))
         for walk_id in walk_ids:
             conn.execute("DELETE FROM walk_sources WHERE walk_id = ?", (walk_id,))
             conn.execute("DELETE FROM walk_analytics WHERE walk_id = ?", (walk_id,))
+
+
+def update_walk_id_references(old_walk_id: str, new_walk_id: str) -> None:
+    """
+    Atomically updates all database records referencing old_walk_id to use new_walk_id.
+    """
+    with analytics_conn() as conn:
+        conn.execute("UPDATE walk_sources SET walk_id = ? WHERE walk_id = ?", (new_walk_id, old_walk_id))
+        conn.execute("UPDATE walk_analytics SET walk_id = ? WHERE walk_id = ?", (new_walk_id, old_walk_id))
+        conn.execute("UPDATE share_links SET walk_id = ? WHERE walk_id = ?", (new_walk_id, old_walk_id))
+
+
+
+def insert_system_log(
+    level: str,
+    category: str,
+    message: str,
+    service: str | None = None,
+    details: str | dict | None = None,
+    user_sub: str | None = None,
+    is_auth_issue: bool = False,
+    is_connection_issue: bool = False,
+    timestamp: str | None = None,
+) -> int:
+    if timestamp is None:
+        timestamp = datetime.now(timezone.utc).isoformat()
+    if isinstance(details, (dict, list)):
+        details_str = json.dumps(details)
+    else:
+        details_str = str(details) if details is not None else None
+
+    with analytics_conn() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO system_logs (
+                timestamp, level, category, service, message, details,
+                user_sub, is_auth_issue, is_connection_issue
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                timestamp,
+                level.upper(),
+                category.lower(),
+                service.lower() if service else None,
+                message,
+                details_str,
+                user_sub,
+                1 if is_auth_issue else 0,
+                1 if is_connection_issue else 0,
+            ),
+        )
+        return cursor.lastrowid
+
+
+def query_system_logs(
+    category: str | None = None,
+    auth_only: bool = False,
+    exclude_connection: bool = False,
+    is_connection: bool | None = None,
+    level: str | None = None,
+    service: str | None = None,
+    search: str | None = None,
+    user_sub: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    clauses = []
+    params = []
+
+    if user_sub is not None:
+        # Include logs for this user OR system-wide logs (where user_sub is NULL)
+        clauses.append("(user_sub = ? OR user_sub IS NULL)")
+        params.append(user_sub)
+
+    if auth_only:
+        clauses.append("(is_auth_issue = 1 OR category = 'auth')")
+    elif category and category.lower() != "all":
+        clauses.append("category = ?")
+        params.append(category.lower())
+
+    if exclude_connection:
+        clauses.append("is_connection_issue = 0")
+    elif is_connection is not None:
+        clauses.append("is_connection_issue = ?")
+        params.append(1 if is_connection else 0)
+
+    if level and level.upper() != "ALL":
+        clauses.append("level = ?")
+        params.append(level.upper())
+
+    if service and service.lower() != "all":
+        clauses.append("service = ?")
+        params.append(service.lower())
+
+    if search:
+        search_pattern = f"%{search.strip()}%"
+        clauses.append("(message LIKE ? OR details LIKE ? OR service LIKE ?)")
+        params.extend([search_pattern, search_pattern, search_pattern])
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with analytics_conn() as conn:
+        count_query = f"SELECT COUNT(*) FROM system_logs {where_sql}"
+        total_count = conn.execute(count_query, params).fetchone()[0]
+
+        query = f"""
+            SELECT id, timestamp, level, category, service, message, details,
+                   user_sub, is_auth_issue, is_connection_issue
+            FROM system_logs
+            {where_sql}
+            ORDER BY timestamp DESC, id DESC
+            LIMIT ? OFFSET ?
+        """
+        rows = conn.execute(query, params + [limit, offset]).fetchall()
+
+        logs = []
+        for r in rows:
+            parsed_details = None
+            if r[6]:
+                try:
+                    parsed_details = json.loads(r[6])
+                except Exception:
+                    parsed_details = r[6]
+            logs.append({
+                "id": r[0],
+                "timestamp": r[1],
+                "level": r[2],
+                "category": r[3],
+                "service": r[4],
+                "message": r[5],
+                "details": parsed_details,
+                "user_sub": r[7],
+                "is_auth_issue": bool(r[8]),
+                "is_connection_issue": bool(r[9]),
+            })
+
+        return logs, total_count
+
+
+def get_logs_summary(user_sub: str | None = None) -> dict:
+    clauses = []
+    params = []
+    if user_sub is not None:
+        clauses.append("(user_sub = ? OR user_sub IS NULL)")
+        params.append(user_sub)
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with analytics_conn() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM system_logs {where_sql}", params).fetchone()[0]
+        
+        auth_where = f"WHERE (is_auth_issue = 1 OR category = 'auth') {'AND ' + ' AND '.join(clauses) if clauses else ''}"
+        auth_count = conn.execute(f"SELECT COUNT(*) FROM system_logs {auth_where}", params).fetchone()[0]
+
+        conn_where = f"WHERE is_connection_issue = 1 {'AND ' + ' AND '.join(clauses) if clauses else ''}"
+        connection_count = conn.execute(f"SELECT COUNT(*) FROM system_logs {conn_where}", params).fetchone()[0]
+
+        err_where = f"WHERE level = 'ERROR' {'AND ' + ' AND '.join(clauses) if clauses else ''}"
+        error_count = conn.execute(f"SELECT COUNT(*) FROM system_logs {err_where}", params).fetchone()[0]
+
+        warn_where = f"WHERE level = 'WARNING' {'AND ' + ' AND '.join(clauses) if clauses else ''}"
+        warning_count = conn.execute(f"SELECT COUNT(*) FROM system_logs {warn_where}", params).fetchone()[0]
+
+        return {
+            "total_logs": total,
+            "auth_issues_count": auth_count,
+            "connection_issues_count": connection_count,
+            "error_count": error_count,
+            "warning_count": warning_count,
+        }
+
+
+def clear_system_logs(user_sub: str | None = None, before_timestamp: str | None = None) -> int:
+    clauses = []
+    params = []
+    if user_sub is not None:
+        clauses.append("user_sub = ?")
+        params.append(user_sub)
+    if before_timestamp is not None:
+        clauses.append("timestamp < ?")
+        params.append(before_timestamp)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    with analytics_conn() as conn:
+        cursor = conn.execute(f"DELETE FROM system_logs {where_sql}", params)
+        return cursor.rowcount
+
