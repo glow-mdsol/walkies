@@ -75,7 +75,10 @@ def test_new_walk_upload_assigns_uuid(monkeypatch, tmp_path):
     response = client.post(
         "/api/walks/upload",
         data={"date": "2026-08-25", "name": "Morning Stroll"},
-        files=[("files", ("test.fit", fit_bytes, "application/octet-stream"))],
+        files=[
+            ("files", ("test.fit", fit_bytes, "application/octet-stream")),
+            ("files", ("carelink.csv", b"dummy_carelink_csv", "text/csv")),
+        ],
     )
     assert response.status_code == 200
     data = response.json()
@@ -186,11 +189,12 @@ def test_migrate_existing_walks_to_uuids(tmp_path):
     cached_1 = get_cached_analytics_row(new_uuid_1)
     assert cached_1 is not None
     assert cached_1["walk_id"] == new_uuid_1
-    assert cached_1["walk_name"] == "Mountain Hike"
+    assert cached_1["name"] == "Mountain Hike"
 
     cached_2 = get_cached_analytics_row(new_uuid_2)
     assert cached_2 is not None
     assert cached_2["walk_id"] == new_uuid_2
+    assert cached_2["name"] == "Evening Park"
 
     # Share link updated
     share_row = get_share_link("share-token-legacy-1")
@@ -198,8 +202,8 @@ def test_migrate_existing_walks_to_uuids(tmp_path):
     assert share_row["walk_id"] == new_uuid_1
 
     # 7. Check backward-compatible directory lookups
-    assert _find_walk_dir(new_uuid_1, tmp_path) == new_dir_1
-    assert _find_walk_dir(legacy_id_1, tmp_path) == new_dir_1
+    assert _find_walk_dir(new_uuid_1, user_dir) == new_dir_1
+    assert _find_walk_dir(legacy_id_1, user_dir) == new_dir_1
 
     # 8. Idempotency test: running migration again does nothing
     second_run = migrate_walk_ids_to_uuids(tmp_path)
