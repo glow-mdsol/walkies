@@ -7,14 +7,16 @@ import re
 import secrets
 import shutil
 import struct
+import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import date as date_type, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 import xml.etree.ElementTree as ET
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import BackgroundTasks, Body, Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import JSONResponse
@@ -34,10 +36,40 @@ from analytics import (
     persist_walk_analytics,
     refresh_walk_analytics_if_needed,
     revoke_share_link,
+    upsert_share_link,
     get_user_settings,
     upsert_user_settings,
     delete_user_data,
+    insert_system_log,
+    query_system_logs,
+    get_logs_summary,
+    clear_system_logs,
+    update_walk_id_references,
+    migrate_walk_ids_to_uuids,
+    WalkiesDBLogHandler,
+    log_system_event,
 )
+
+import logging
+import sys
+
+# Configure standard application logger
+LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.INFO)
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="[%(asctime)s] [%(levelname)s] [%(name)s] [%(filename)s:%(lineno)d] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger("walkies")
+db_log_handler = WalkiesDBLogHandler()
+db_log_handler.setLevel(LOG_LEVEL)
+logger.addHandler(db_log_handler)
+
 
 app = FastAPI()
 
@@ -58,6 +90,11 @@ AUTH_SCHEME = HTTPBearer(auto_error=False)
 FIT_EPOCH = datetime(1989, 12, 31, tzinfo=timezone.utc)
 BG_CONTEXT_WINDOW = timedelta(minutes=30)
 init_analytics_db()
+try:
+    migrate_walk_ids_to_uuids(DATA_DIR)
+except Exception as _e:
+    logger.warning(f"Initial walk UUID migration encountered error: {_e}")
+
 
 
 def _safe_user_token(user_sub: str) -> str:
@@ -145,6 +182,14 @@ def _find_walk_dir(walk_id: str, data_root: Path = DATA_DIR) -> Path | None:
     for walk_dir in _iter_walk_dirs(data_root):
         if walk_dir.name == walk_id:
             return walk_dir
+        meta_file = walk_dir / "meta.json"
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                if meta.get("id") == walk_id or meta.get("legacy_id") == walk_id:
+                    return walk_dir
+            except Exception:
+                pass
     return None
 
 
@@ -190,31 +235,25 @@ def _load_walk_meta(walk_dir: Path) -> dict:
             meta = {}
     meta = _backfill_walk_meta(walk_dir, meta)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != "meta.json")
+    walk_id = meta.get("id") or walk_dir.name
     return {
-        "id": walk_dir.name,
+        "id": walk_id,
+        "legacy_id": meta.get("legacy_id"),
         "date": meta.get("date", date),
         "name": meta.get("name", ""),
+        "rating": meta.get("rating", 3),
         "start_time": meta.get("start_time"),
         "fit_identity": meta.get("fit_identity"),
         "carelink_start_time": meta.get("carelink_start_time"),
         "carelink_end_time": meta.get("carelink_end_time"),
+        "garmin_activity_id": meta.get("garmin_activity_id"),
         "files": files,
     }
 
 
-def _make_walk_id(date: str, fit_start_dt: datetime | None, name: str, date_dir: Path, user_sub: str | None = None) -> str:
-    time_part = (fit_start_dt or datetime.now(timezone.utc)).strftime("%H%M%S")
-    user_tag = ''
-    if user_sub:
-        safe = _safe_user_token(user_sub)
-        user_tag = f"-{safe[:6]}" if safe else ''
-    base = f"{date}-{time_part}-{_slugify(name)}{user_tag}"
-    candidate = base
-    suffix = 2
-    while (date_dir / candidate).exists():
-        candidate = f"{base}-{suffix}"
-        suffix += 1
-    return candidate
+def _make_walk_id(date: str | None = None, fit_start_dt: datetime | None = None, name: str | None = None, date_dir: Path | None = None, user_sub: str | None = None) -> str:
+    return str(uuid.uuid4())
+
 
 
 def _fit_start_datetime(data: bytes) -> datetime | None:
@@ -2833,11 +2872,13 @@ def walk_analysis_data(walk_id: str, request: Request, user: dict = Depends(_req
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
     walk_dir = _find_walk_dir(walk_id, data_root)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
+    meta = _load_walk_meta(walk_dir) if walk_dir else {}
     settings = get_user_settings(user['sub'])
     result = {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
+        'rating': meta.get('rating', 3) if walk_dir else 3,
         'payload': payload,
         'metrics': metrics,
         'files': files,
@@ -2850,11 +2891,14 @@ def walk_analysis_data(walk_id: str, request: Request, user: dict = Depends(_req
 def walk_analysis(walk_id: str, request: Request, user: dict = Depends(_require_user)):
     data_root = _user_data_dir(user['sub'])
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
+    walk_dir = _find_walk_dir(walk_id, data_root)
+    meta = _load_walk_meta(walk_dir) if walk_dir else {}
     settings = get_user_settings(user['sub'])
     result = {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
+        'rating': meta.get('rating', 3) if walk_dir else 3,
         'payload': payload,
         'metrics': metrics,
         'user_settings': settings,
@@ -2926,11 +2970,13 @@ def shared_walk_analysis_data(token: str, request: Request):
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
     walk_dir = _find_walk_dir(walk_id, data_root)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
+    meta = _load_walk_meta(walk_dir) if walk_dir else {}
     settings = get_user_settings(owner_sub)
     result = {
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
+        'rating': meta.get('rating', 3) if walk_dir else 3,
         'payload': payload,
         'metrics': metrics,
         'files': files,
@@ -3051,5 +3097,809 @@ def delete_account(user: dict = Depends(_require_user)):
     if data_root.exists() and data_root.is_dir():
         shutil.rmtree(data_root, ignore_errors=True)
     return {"status": "ok"}
+
+
+@app.post("/api/walks/{walk_id}/rename")
+def rename_walk(
+    walk_id: str,
+    payload: dict,
+    user: dict = Depends(_require_user),
+):
+    new_name = payload.get("name", "").strip()
+    data_root = _user_data_dir(user['sub'])
+    walk_dir = _find_walk_dir(walk_id, data_root)
+    if walk_dir is None or not walk_dir.exists():
+        raise HTTPException(status_code=404, detail="Walk not found")
+
+    # 1. Update meta.json
+    meta_file = walk_dir / "meta.json"
+    meta = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    meta["name"] = new_name
+    meta_file.write_text(json.dumps(meta), encoding="utf-8")
+
+    # 2. Update the walk_analytics table (if cached)
+    from analytics.db import analytics_conn
+    with analytics_conn() as conn:
+        conn.execute(
+            "UPDATE walk_analytics SET walk_name = ? WHERE walk_id = ?",
+            (new_name, walk_id)
+        )
+
+    return {"status": "ok", "name": new_name}
+
+
+@app.post("/api/walks/{walk_id}/rate")
+def rate_walk(
+    walk_id: str,
+    payload: dict,
+    user: dict = Depends(_require_user),
+):
+    rating = payload.get("rating")
+    if rating is None or not isinstance(rating, int) or not (1 <= rating <= 5):
+        raise HTTPException(status_code=400, detail="Rating must be an integer between 1 and 5")
+
+    data_root = _user_data_dir(user['sub'])
+    walk_dir = _find_walk_dir(walk_id, data_root)
+    if walk_dir is None or not walk_dir.exists():
+        raise HTTPException(status_code=404, detail="Walk not found")
+
+    # 1. Update meta.json
+    meta_file = walk_dir / "meta.json"
+    meta = {}
+    if meta_file.exists():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    meta["rating"] = rating
+    meta_file.write_text(json.dumps(meta), encoding="utf-8")
+
+    # 2. Update the walk_analytics table (if cached)
+    from analytics.db import analytics_conn
+    with analytics_conn() as conn:
+        conn.execute(
+            "UPDATE walk_analytics SET rating = ? WHERE walk_id = ?",
+            (rating, walk_id)
+        )
+
+    return {"status": "ok", "rating": rating}
+
+
+import queue
+import threading
+
+class GarminAuthState:
+    def __init__(self):
+        self.mfa_code_queue = queue.Queue(maxsize=1)
+        self.mfa_requested = threading.Event()
+        self.mfa_received = threading.Event()
+        self.auth_completed = threading.Event()
+        self.error = None
+
+active_auth_attempts: dict[str, GarminAuthState] = {}
+
+
+@app.post("/api/garmin/login")
+def garmin_login(
+    payload: dict,
+    user: dict = Depends(_require_user),
+):
+    email = payload.get("email", "").strip()
+    password = payload.get("password", "")
+    mfa_code = payload.get("mfa_code", "").strip()
+
+    user_sub = user['sub']
+    data_root = _user_data_dir(user_sub)
+    token_store = str(data_root / ".garminconnect")
+    os.makedirs(token_store, exist_ok=True)
+
+    if mfa_code:
+        logger.info(f"Received MFA code submission for user sub: {user_sub}")
+        state = active_auth_attempts.get(user_sub)
+        if not state:
+            logger.warning(f"MFA submission failed: No active Garmin login session found for user sub: {user_sub}")
+            raise HTTPException(status_code=400, detail="No active login session. Please restart connect.")
+        try:
+            state.mfa_code_queue.put(mfa_code, timeout=5)
+            state.mfa_received.set()
+        except queue.Full:
+            logger.warning(f"MFA submission failed: queue full for user sub: {user_sub}")
+            raise HTTPException(status_code=400, detail="MFA code already submitted or queue full.")
+
+        completed = state.auth_completed.wait(timeout=15)
+        if not completed:
+            active_auth_attempts.pop(user_sub, None)
+            logger.error(f"Garmin MFA login timed out completing MFA authentication for user sub: {user_sub}")
+            raise HTTPException(status_code=504, detail="Garmin login timed out completing MFA authentication.")
+
+        if state.error:
+            err = state.error
+            active_auth_attempts.pop(user_sub, None)
+            logger.error(f"Garmin MFA login worker finished with error for user sub: {user_sub}. Error: {err}")
+            raise HTTPException(status_code=400, detail=f"Login failed: {err}")
+
+        # Update garmin_email on success
+        settings = get_user_settings(user_sub) or {}
+        settings["garmin_email"] = email
+        upsert_user_settings(user_sub, settings)
+
+        active_auth_attempts.pop(user_sub, None)
+        logger.info(f"Garmin MFA authentication succeeded for user sub: {user_sub}")
+        return {"status": "success", "message": "Successfully authenticated with Garmin!"}
+
+    # Initial Auth Trigger
+    # Set up auth state
+    logger.info(f"Initiating Garmin login connection trigger for user sub: {user_sub}, email: {email}")
+    state = GarminAuthState()
+    active_auth_attempts[user_sub] = state
+
+    def garmin_login_worker():
+        try:
+            from garminconnect import Garmin
+
+            def mfa_callback():
+                state.mfa_requested.set()
+                logger.info(f"Garmin login triggered MFA request for user sub: {user_sub}")
+                try:
+                    code = state.mfa_code_queue.get(timeout=120)  # Wait up to 2 mins
+                    logger.info(f"MFA code received from queue for user sub: {user_sub}, completing login")
+                    return code
+                except queue.Empty:
+                    logger.warning(f"Garmin MFA code input timed out for user sub: {user_sub}")
+                    raise Exception("MFA validation timed out.")
+
+            client = Garmin(
+                email=email,
+                password=password,
+                prompt_mfa=mfa_callback,
+            )
+            client.login(tokenstore=token_store)
+            state.auth_completed.set()
+        except Exception as e:
+            state.error = str(e)
+            logger.error(f"Garmin login worker failed for user sub: {user_sub}. Error: {e}", exc_info=True)
+            state.auth_completed.set()
+
+    thread = threading.Thread(target=garmin_login_worker)
+    thread.start()
+
+    # Poll until either MFA is explicitly requested, auth completes, or timeout
+    timeout_s = 20.0
+    start_t = time.time()
+    while time.time() - start_t < timeout_s:
+        if state.mfa_requested.is_set():
+            logger.info(f"Garmin login requires MFA challenge for user sub: {user_sub}")
+            return {"status": "mfa_required"}
+        if state.auth_completed.is_set():
+            break
+        time.sleep(0.1)
+
+    if state.auth_completed.is_set():
+        if state.error:
+            err = state.error
+            active_auth_attempts.pop(user_sub, None)
+            logger.error(f"Garmin login failed on initial connection for user sub: {user_sub}. Error: {err}")
+            clean_err = err
+            if any(term in err.lower() for term in ["401", "authentication", "credentials", "invalid", "password", "login failed"]):
+                clean_err = "Invalid Garmin email or password. Please verify your credentials and try again."
+            raise HTTPException(status_code=400, detail=clean_err)
+
+        # Immediate success (no MFA needed or cached session reused)
+        settings = get_user_settings(user_sub) or {}
+        settings["garmin_email"] = email
+        upsert_user_settings(user_sub, settings)
+        active_auth_attempts.pop(user_sub, None)
+        logger.info(f"Garmin connection established successfully (no MFA required) for user sub: {user_sub}")
+        return {"status": "success"}
+
+    if state.mfa_requested.is_set():
+        logger.info(f"Garmin login requires MFA challenge for user sub: {user_sub}")
+        return {"status": "mfa_required"}
+
+    active_auth_attempts.pop(user_sub, None)
+    logger.error(f"Garmin login timed out connecting for user sub: {user_sub}")
+    raise HTTPException(status_code=504, detail="Garmin login timed out. Please check your connection and credentials and try again.")
+
+
+def _import_single_garmin_activity(
+    client,
+    activity_id: str | int,
+    act_data: dict | None,
+    data_root: Path,
+    user_sub: str,
+    override_name: str | None = None,
+    override_date: str | None = None,
+    carelink_bytes: bytes | None = None,
+    carelink_filename: str | None = None,
+    gpx_bytes: bytes | None = None,
+    gpx_filename: str | None = None,
+) -> dict:
+    activity_id_str = str(activity_id)
+    if not act_data:
+        try:
+            act_data = client.get_activity(activity_id)
+        except Exception:
+            act_data = {}
+
+    start_time_str = act_data.get("startTimeLocal") or ""
+    act_date = override_date.strip() if override_date and override_date.strip() else (start_time_str.split(" ")[0] if start_time_str else datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+    # Download FIT data
+    fit_data = client.download_activity(activity_id, dl_fmt=client.ActivityDownloadFormat.FIT)
+    fit_start_dt, fit_end_dt = _fit_time_bounds(fit_data)
+    fit_identity = _fit_file_identity(fit_data)
+
+    date_dir = data_root / act_date
+    date_dir.mkdir(exist_ok=True)
+    act_name = override_name.strip() if override_name and override_name.strip() else act_data.get("activityName", "Walk").strip()
+    walk_id = _make_walk_id(act_date, fit_start_dt, act_name, date_dir, user_sub=user_sub)
+    walk_dir = date_dir / walk_id
+    walk_dir.mkdir(exist_ok=False)
+
+    logger.info(f"Importing Garmin activity {activity_id_str} as Walk ID {walk_id} in {walk_dir}")
+    (walk_dir / f"activity_{activity_id_str}.fit").write_bytes(fit_data)
+
+    reused_carelink_from = None
+    carelink_start_time = None
+    carelink_end_time = None
+
+    if carelink_bytes and carelink_filename:
+        safe_carelink_name = Path(carelink_filename).name
+        if not safe_carelink_name.lower().endswith(".csv"):
+            safe_carelink_name += ".csv"
+        (walk_dir / safe_carelink_name).write_bytes(carelink_bytes)
+    else:
+        # Autolink Carelink file (if uploaded date covers this range)
+        reused_carelink = _find_reusable_carelink_csv(fit_start_dt, fit_end_dt, data_root=data_root)
+        if reused_carelink is not None:
+            reused_csv_path, reused_meta = reused_carelink
+            reused_carelink_from = reused_meta["id"]
+            carelink_start_time = reused_meta.get("carelink_start_time")
+            carelink_end_time = reused_meta.get("carelink_end_time")
+            (walk_dir / reused_csv_path.name).write_bytes(reused_csv_path.read_bytes())
+
+    if gpx_bytes and gpx_filename:
+        safe_gpx_name = Path(gpx_filename).name
+        if not safe_gpx_name.lower().endswith(".gpx"):
+            safe_gpx_name += ".gpx"
+        (walk_dir / safe_gpx_name).write_bytes(gpx_bytes)
+
+    meta = {
+        "id": walk_id,
+        "date": act_date,
+        "name": act_name,
+        "start_time": fit_start_dt.isoformat() if fit_start_dt is not None else None,
+        "fit_identity": fit_identity,
+        "garmin_activity_id": activity_id_str,
+        "rating": 3,
+    }
+    if reused_carelink_from is not None:
+        meta["carelink_reused_from"] = reused_carelink_from
+        meta["carelink_start_time"] = carelink_start_time
+        meta["carelink_end_time"] = carelink_end_time
+
+    (walk_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    refresh_walk_analytics_if_needed(
+        walk_id,
+        force=True,
+        find_walk_dir=lambda wid: _find_walk_dir(wid, data_root),
+        get_walk_analysis_data=lambda wid, persist_analytics=False: _get_walk_analysis_data(
+            wid,
+            persist_analytics=persist_analytics,
+            data_root=data_root,
+        ),
+    )
+    return {"id": walk_id, "name": act_name, "date": act_date}
+
+
+@app.get("/api/garmin/activities")
+def get_garmin_activities(
+    limit: int = 20,
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    settings = get_user_settings(user_sub)
+    if not settings or not settings.get("garmin_email"):
+        raise HTTPException(status_code=400, detail="Garmin Connect not configured.")
+
+    garmin_email = settings["garmin_email"]
+    data_root = _user_data_dir(user_sub)
+    token_store = str(data_root / ".garminconnect")
+
+    from garminconnect import Garmin
+    try:
+        client = Garmin(email=garmin_email, password="")
+        client.login(tokenstore=token_store)
+    except Exception as e:
+        logger.error(f"Garmin session authentication failed: {e}", exc_info=True)
+        raise HTTPException(status_code=401, detail=f"Garmin session invalid: {e}. Please reconnect in Settings.")
+
+    try:
+        activities = client.get_activities(0, min(max(1, limit), 50))
+    except Exception as e:
+        logger.error(f"Garmin API activities fetch failed: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Garmin API call failed: {e}")
+
+    imported_activity_ids = set()
+    imported_start_times = set()
+    for walk_dir in _iter_walk_dirs(data_root):
+        meta = _load_walk_meta(walk_dir)
+        if meta.get("garmin_activity_id"):
+            imported_activity_ids.add(str(meta["garmin_activity_id"]))
+        if meta.get("start_time"):
+            imported_start_times.add(meta["start_time"])
+
+    activity_list = []
+    for act in activities:
+        act_id = str(act.get("activityId"))
+        act_type = act.get("activityType", {}).get("typeKey", "unknown")
+        start_time_str = act.get("startTimeLocal") or ""
+        start_time_gmt = act.get("startTimeGMT")
+        act_date = start_time_str.split(" ")[0] if start_time_str else ""
+
+        already_imported = (act_id in imported_activity_ids) or (bool(start_time_gmt) and start_time_gmt in imported_start_times)
+
+        dist_m = act.get("distance")
+        dist_km = round(dist_m / 1000.0, 2) if dist_m is not None else None
+        dur_s = act.get("duration")
+        dur_min = round(dur_s / 60.0, 1) if dur_s is not None else None
+
+        activity_list.append({
+            "activity_id": act_id,
+            "name": act.get("activityName") or "Walk",
+            "activity_type": act_type,
+            "start_time_local": start_time_str,
+            "start_time_gmt": start_time_gmt,
+            "date": act_date,
+            "distance_km": dist_km,
+            "duration_min": dur_min,
+            "avg_hr": act.get("averageHR"),
+            "max_hr": act.get("maxHR"),
+            "already_imported": already_imported,
+        })
+
+    return {"activities": activity_list, "garmin_email": garmin_email}
+
+
+@app.post("/api/garmin/activities/import")
+async def import_selected_garmin_activity(
+    activity_id: str = Form(...),
+    name: Optional[str] = Form(None),
+    date: Optional[str] = Form(None),
+    carelink_file: Optional[UploadFile] = File(None),
+    gpx_file: Optional[UploadFile] = File(None),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    settings = get_user_settings(user_sub)
+    if not settings or not settings.get("garmin_email"):
+        raise HTTPException(status_code=400, detail="Garmin Connect not configured.")
+
+    garmin_email = settings["garmin_email"]
+    data_root = _user_data_dir(user_sub)
+    token_store = str(data_root / ".garminconnect")
+
+    from garminconnect import Garmin
+    try:
+        client = Garmin(email=garmin_email, password="")
+        client.login(tokenstore=token_store)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Garmin session invalid: {e}. Please reconnect.")
+
+    carelink_bytes = None
+    carelink_filename = None
+    if carelink_file:
+        carelink_bytes = await carelink_file.read()
+        carelink_filename = carelink_file.filename
+
+    gpx_bytes = None
+    gpx_filename = None
+    if gpx_file:
+        gpx_bytes = await gpx_file.read()
+        gpx_filename = gpx_file.filename
+
+    try:
+        imported_walk = _import_single_garmin_activity(
+            client=client,
+            activity_id=activity_id,
+            act_data={"activityId": activity_id, "activityName": name or "Walk", "startTimeLocal": f"{date} 00:00:00" if date else None},
+            data_root=data_root,
+            user_sub=user_sub,
+            override_name=name,
+            override_date=date,
+            carelink_bytes=carelink_bytes,
+            carelink_filename=carelink_filename,
+            gpx_bytes=gpx_bytes,
+            gpx_filename=gpx_filename,
+        )
+    except Exception as e:
+        logger.error(f"Failed to import Garmin activity {activity_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Failed to import Garmin activity: {e}")
+
+    return {"status": "ok", "walk": imported_walk}
+
+
+@app.post("/api/garmin/sync")
+def sync_garmin_walks(
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    logger.info(f"Starting Garmin activity sync for user sub: {user_sub}")
+    settings = get_user_settings(user_sub)
+    if not settings or not settings.get("garmin_email"):
+        logger.warning(f"Garmin sync aborted: no Garmin email connected for user sub: {user_sub}")
+        raise HTTPException(status_code=400, detail="Garmin Connect not configured.")
+
+    garmin_email = settings["garmin_email"]
+    data_root = _user_data_dir(user_sub)
+    token_store = str(data_root / ".garminconnect")
+
+    from garminconnect import Garmin
+    try:
+        logger.info(f"Logging into Garmin using tokenstore at {token_store} for user sub: {user_sub}")
+        client = Garmin(email=garmin_email, password="")
+        client.login(tokenstore=token_store)
+    except Exception as e:
+        logger.error(f"Garmin session authentication failed for user sub: {user_sub}. Error: {e}", exc_info=True)
+        raise HTTPException(status_code=401, detail=f"Garmin session invalid: {e}. Please reconnect.")
+
+    try:
+        logger.info(f"Fetching recent Garmin activities list for user sub: {user_sub}")
+        activities = client.get_activities(0, 10)
+        logger.info(f"Successfully fetched {len(activities)} activities from Garmin API")
+    except Exception as e:
+        logger.error(f"Garmin API activities fetch failed for user sub: {user_sub}. Error: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Garmin API call failed: {e}")
+
+    imported_walks = []
+    for act in activities:
+        act_type = act.get("activityType", {}).get("typeKey")
+        activity_id = act["activityId"]
+        start_time_str = act.get("startTimeLocal")
+
+        logger.debug(f"Evaluating Garmin activity {activity_id} ({act_type}) start time: {start_time_str}")
+        if act_type not in ("walking", "hiking"):
+            continue
+
+        if not start_time_str:
+            continue
+        act_date = start_time_str.split(" ")[0]
+
+        # Duplicate checking
+        already_imported = False
+        for walk_dir in _iter_walk_dirs(data_root):
+            meta = _load_walk_meta(walk_dir)
+            if meta.get("garmin_activity_id") == str(activity_id) or meta.get("start_time") == act.get("startTimeGMT"):
+                already_imported = True
+                break
+
+        if already_imported:
+            logger.debug(f"Garmin activity {activity_id} already imported. Skipping.")
+            continue
+
+        try:
+            walk_info = _import_single_garmin_activity(
+                client=client,
+                activity_id=activity_id,
+                act_data=act,
+                data_root=data_root,
+                user_sub=user_sub,
+            )
+            imported_walks.append(walk_info)
+        except Exception as e:
+            logger.error(f"Failed to import activity {activity_id}: {e}", exc_info=True)
+            continue
+
+    return {"status": "ok", "imported": imported_walks}
+
+
+
+@app.post("/api/carelink/upload-token")
+async def carelink_upload_token(
+    file: UploadFile = File(...),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    logger.info(f"Received CareLink login tokens upload request for user sub: {user_sub}")
+    data_root = _user_data_dir(user_sub)
+    carelink_dir = data_root / ".carelink"
+    carelink_dir.mkdir(exist_ok=True)
+    
+    try:
+        content = await file.read()
+        token_data = json.loads(content.decode("utf-8"))
+    except Exception as e:
+        logger.error(f"CareLink token upload failed: Invalid JSON format for user sub: {user_sub}. Error: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Invalid JSON file: {e}")
+        
+    required_fields = ["access_token", "refresh_token", "scope", "client_id"]
+    for f in required_fields:
+        if f not in token_data:
+            logger.warning(f"CareLink token upload failed: Missing required field '{f}' for user sub: {user_sub}")
+            raise HTTPException(status_code=400, detail=f"Missing required field in token file: {f}")
+            
+    token_path = carelink_dir / "logindata.json"
+    token_path.write_bytes(content)
+    logger.info(f"Wrote CareLink tokens to {token_path}. Running connection test...")
+    
+    from carelink_client2 import CareLinkClient
+    try:
+        client = CareLinkClient(tokenFile=str(token_path))
+        success = client.init()
+        if not success:
+            raise Exception("CareLinkClient initialization failed.")
+        logger.info(f"CareLink connection test completed successfully for user sub: {user_sub}")
+    except Exception as e:
+        logger.error(f"CareLink connection test failed for user sub: {user_sub}. Error: {e}", exc_info=True)
+        if token_path.exists():
+            token_path.unlink()
+        raise HTTPException(status_code=400, detail=f"CareLink connection test failed: {e}")
+        
+    payload = client._get_access_token_payload(token_data)
+    username = None
+    if payload and "token_details" in payload:
+        username = payload["token_details"].get("preferred_username")
+    if not username:
+        username = "Connected CareLink Account"
+        
+    settings = get_user_settings(user_sub) or {}
+    settings["carelink_email"] = username
+    upsert_user_settings(user_sub, settings)
+    
+    logger.info(f"Successfully configured CareLink integration for username: {username}, user sub: {user_sub}")
+    return {"status": "success", "username": username}
+
+
+@app.post("/api/carelink/sync")
+def sync_carelink_data(
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    logger.info(f"Starting CareLink automated sync for user sub: {user_sub}")
+    settings = get_user_settings(user_sub)
+    if not settings or not settings.get("carelink_email"):
+        logger.warning(f"CareLink sync aborted: CareLink not connected for user sub: {user_sub}")
+        raise HTTPException(status_code=400, detail="CareLink not configured.")
+        
+    data_root = _user_data_dir(user_sub)
+    token_path = data_root / ".carelink" / "logindata.json"
+    if not token_path.exists():
+        logger.error(f"CareLink sync failed: token file not found at {token_path} for user sub: {user_sub}")
+        raise HTTPException(status_code=400, detail="CareLink token file not found. Please reconnect.")
+        
+    from carelink_client2 import CareLinkClient
+    try:
+        logger.info(f"Connecting to CareLink using tokens file for user sub: {user_sub}")
+        client = CareLinkClient(tokenFile=str(token_path))
+        if not client.init():
+            raise Exception("Failed to initialize CareLink client.")
+        logger.info(f"Fetching recent data from CareLink API for user sub: {user_sub}")
+        recent_data = client.getRecentData()
+        if not recent_data:
+            raise Exception("No data returned from CareLink.")
+    except Exception as e:
+        logger.error(f"CareLink connection or data fetch failed for user sub: {user_sub}. Error: {e}", exc_info=True)
+        raise HTTPException(status_code=401, detail=f"CareLink sync failed: {e}. Please re-authenticate.")
+        
+    if "patientData" in recent_data:
+        recent_data = recent_data["patientData"]
+        
+    sgs = recent_data.get("sgs", [])
+    markers = recent_data.get("markers", [])
+    logger.info(f"Retrieved {len(sgs)} glucose readings and {len(markers)} markers from CareLink API")
+    
+    walks_updated = []
+    
+    for walk_dir in _iter_walk_dirs(data_root):
+        meta = _load_walk_meta(walk_dir)
+        start_time_iso = meta.get("start_time")
+        if not start_time_iso:
+            continue
+        try:
+            walk_start = datetime.fromisoformat(start_time_iso)
+        except ValueError:
+            continue
+            
+        fit_files = list(walk_dir.glob("activity_*.fit"))
+        if not fit_files:
+            walk_end = walk_start + timedelta(hours=1)
+        else:
+            fit_path = fit_files[0]
+            fit_start, fit_end = _fit_time_bounds(fit_path.read_bytes())
+            walk_start = fit_start if fit_start is not None else walk_start
+            walk_end = fit_end if fit_end is not None else (walk_start + timedelta(hours=1))
+            
+        pad_start = walk_start - timedelta(minutes=30)
+        pad_end = walk_end + timedelta(minutes=60)
+        
+        walk_sgs = []
+        for sg in sgs:
+            ts_str = sg.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                sg_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if pad_start <= sg_ts <= pad_end:
+                walk_sgs.append((sg_ts, sg))
+                
+        if not walk_sgs:
+            continue
+            
+        walk_markers = []
+        for marker in markers:
+            ts_str = marker.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                m_ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if pad_start <= m_ts <= pad_end:
+                walk_markers.append((m_ts, marker))
+                
+        csv_rows = []
+        
+        for idx, (sg_ts, sg) in enumerate(walk_sgs):
+            val_mgdl = sg.get("sg")
+            if val_mgdl is None or val_mgdl <= 0:
+                continue
+            val_mmol = round(val_mgdl * 0.0555, 2)
+            date_str = sg_ts.strftime("%Y/%m/%d")
+            time_str = sg_ts.strftime("%H:%M:%S")
+            csv_rows.append({
+                "Index": idx + 1,
+                "Date": date_str,
+                "Time": time_str,
+                "Sensor Glucose (mmol/L)": val_mmol,
+                "Basal Rate (U/h)": "",
+                "Bolus Volume Delivered (U)": "",
+                "Suspend": "",
+                "Auto Mode": ""
+            })
+            
+        for (m_ts, marker) in walk_markers:
+            if marker.get("type") == "INSULIN":
+                amount = marker.get("amount")
+                if amount is not None and amount > 0:
+                    date_str = m_ts.strftime("%Y/%m/%d")
+                    time_str = m_ts.strftime("%H:%M:%S")
+                    csv_rows.append({
+                        "Index": len(csv_rows) + 1,
+                        "Date": date_str,
+                        "Time": time_str,
+                        "Sensor Glucose (mmol/L)": "",
+                        "Basal Rate (U/h)": "",
+                        "Bolus Volume Delivered (U)": amount,
+                        "Suspend": "",
+                        "Auto Mode": ""
+                    })
+                    
+        def parse_row_ts(r):
+            return datetime.strptime(f"{r['Date']} {r['Time']}", "%Y/%m/%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            
+        csv_rows.sort(key=parse_row_ts)
+        
+        csv_path = walk_dir / "carelink_sync.csv"
+        headers = ["Index", "Date", "Time", "Sensor Glucose (mmol/L)", "Basal Rate (U/h)", "Bolus Volume Delivered (U)", "Suspend", "Auto Mode"]
+        
+        logger.info(f"Writing {len(csv_rows)} synchronized CareLink records to {csv_path} for Walk ID: {meta['id']}")
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for idx, r in enumerate(csv_rows):
+                writer.writerow([
+                    idx + 1,
+                    r["Date"],
+                    r["Time"],
+                    r["Sensor Glucose (mmol/L)"],
+                    r["Basal Rate (U/h)"],
+                    r["Bolus Volume Delivered (U)"],
+                    r["Suspend"],
+                    r["Auto Mode"]
+                ])
+                
+        meta["carelink_reused_from"] = None
+        meta["carelink_start_time"] = walk_start.isoformat()
+        meta["carelink_end_time"] = walk_end.isoformat()
+        (walk_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        
+        logger.info(f"Refreshing analytics overlay for synced Walk ID: {meta['id']}")
+        refresh_walk_analytics_if_needed(
+            meta["id"],
+            force=True,
+            find_walk_dir=lambda wid: _find_walk_dir(wid, data_root),
+            get_walk_analysis_data=lambda wid, persist_analytics=False: _get_walk_analysis_data(
+                wid,
+                persist_analytics=persist_analytics,
+                data_root=data_root,
+            ),
+        )
+        walks_updated.append({"id": meta["id"], "name": meta.get("name"), "date": meta.get("date")})
+        
+    logger.info(f"CareLink automated sync completed successfully. Synced {len(walks_updated)} walk(s).")
+    return {"status": "ok", "synced_walks": walks_updated}
+
+
+@app.get("/api/system/logs")
+def get_system_logs(
+    category: str | None = None,
+    auth_only: bool = False,
+    exclude_connection: bool = False,
+    is_connection: bool | None = None,
+    level: str | None = None,
+    service: str | None = None,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    logs, total = query_system_logs(
+        category=category,
+        auth_only=auth_only,
+        exclude_connection=exclude_connection,
+        is_connection=is_connection,
+        level=level,
+        service=service,
+        search=search,
+        user_sub=user_sub,
+        limit=min(max(1, limit), 500),
+        offset=max(0, offset),
+    )
+    summary = get_logs_summary(user_sub=user_sub)
+    return {
+        "logs": logs,
+        "total": total,
+        "summary": summary,
+    }
+
+
+@app.get("/api/system/logs/summary")
+def get_system_logs_summary(
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    return get_logs_summary(user_sub=user_sub)
+
+
+@app.post("/api/system/logs/clear")
+def clear_system_logs_endpoint(
+    payload: dict = Body(default={}),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    before_ts = payload.get("before_timestamp")
+    cleared = clear_system_logs(user_sub=user_sub, before_timestamp=before_ts)
+    return {"status": "ok", "cleared_count": cleared}
+
+
+@app.post("/api/system/logs/test")
+def emit_test_system_log(
+    payload: dict = Body(...),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    log_id = log_system_event(
+        level=payload.get("level", "INFO"),
+        message=payload.get("message", "Test system log event"),
+        category=payload.get("category"),
+        service=payload.get("service", "test"),
+        details=payload.get("details"),
+        user_sub=user_sub,
+        is_auth_issue=payload.get("is_auth_issue"),
+        is_connection_issue=payload.get("is_connection_issue"),
+    )
+    return {"status": "ok", "log_id": log_id}
+
+
+
 
 
