@@ -153,7 +153,16 @@ If `task` is installed:
 
 ---
 
-## 5. Testing & Quality Guidelines
+## 5. Workflow, Branching & Scope Discipline
+
+### 1. Keep Work Discrete (Avoid Enormous PRs)
+- **Branch-per-feature**: Always work on a dedicated, short-lived branch for each feature, fix, or chore (e.g., `feat/carb-markers`, `fix/fit-parser-offset`, `refactor/share-token-cleanup`). Never accumulate unrelated changes directly on `main`.
+- **Strict Scope Boundaries**: Strongly avoid **feature creep**. Implement only what is explicitly requested or documented for the current task. Do not bundle opportunistic refactors or unrelated changes into the same branch/PR.
+- **Atomic Commits & Discrete PRs**: Keep PRs small, focused, and easily reviewable. If a new idea or improvement is noticed during implementation, add it to `features.md` or a new task rather than expanding the active branch.
+
+---
+
+## 6. Testing & Quality Guidelines
 
 1. **Always Verify Tests**: Before committing or pushing code, run the entire test suite using `uv run pytest -v` from `backend/`. Ensure all tests pass.
 2. **Mocking External APIs**: External services (Garmin Connect, Medtronic Carelink, Google Auth) must always be mocked in unit tests (see `test_garmin_sync.py` and `test_carelink_sync.py`).

@@ -110,6 +110,11 @@ walkies/
 | Sensitivity factor (default) | 2 mmol/L per U |
 | DIA (Insulin duration) | ~4 hours (peak action ~75 min for rapid analogs) |
 
+## Workflow, Branching & Scope Discipline (Keep Work Discrete)
+- **Branch-per-feature**: Always work on a dedicated, short-lived branch for each task/feature (e.g. `feat/...`, `fix/...`). Never accumulate unrelated changes directly on `main`.
+- **Discrete, focused PRs**: Keep pull requests small and tightly scoped to prevent enormous, unreviewable diffs.
+- **Strictly avoid feature creep**: Implement only what is explicitly requested for the task at hand. Do not bundle opportunistic refactoring or tangential features into the active branch. Capture additional ideas in `features.md` instead.
+
 ## Development & Security Guidelines
 - Always verify all unit tests pass with `uv run pytest -v` before committing.
 - Authentication uses Google OAuth with bearer tokens. For local development/testing without Google OAuth, set `WALKIES_DEV_BYPASS_AUTH=1`.
