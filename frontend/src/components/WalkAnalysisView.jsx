@@ -402,7 +402,7 @@ function loadAnalyticsPrefs() {
   }
 }
 
-export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, shareToken }) {
+export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, shareToken, onRenamed }) {
   const initialPrefs = useMemo(() => loadAnalyticsPrefs(), [])
   const [data, setData] = useState(null)
   const [error, setError] = useState(null)
@@ -417,6 +417,9 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
   const [shareLinks, setShareLinks] = useState([])
   const [shareBusy, setShareBusy] = useState(false)
   const [shareMessage, setShareMessage] = useState(null)
+  const [isEditingName, setIsEditingName] = useState(false)
+  const [editedName, setEditedName] = useState('')
+  const [rating, setRating] = useState(3)
 
   const loadShareLinks = useCallback(() => {
     if (!walkId || shareToken || !apiFetch) return
@@ -481,6 +484,62 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
       setAnalysisTab('general')
     }
   }, [hasCGM, analysisTab])
+
+  useEffect(() => {
+    if (data?.name != null) {
+      setEditedName(data.name)
+    } else if (data?.date != null) {
+      setEditedName(data.date)
+    }
+  }, [data])
+
+  const handleRenameSubmit = async (e) => {
+    e.preventDefault()
+    if (!walkId || !apiFetch) return
+    try {
+      const res = await apiFetch(`/api/walks/${encodeURIComponent(walkId)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: editedName })
+      })
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}))
+        throw new Error(payload.detail || 'Failed to rename walk')
+      }
+      const resData = await res.json()
+      setData(prev => prev ? { ...prev, name: resData.name } : prev)
+      setIsEditingName(false)
+      if (onRenamed) onRenamed()
+    } catch (err) {
+      alert(err.message || 'Failed to rename walk')
+    }
+  }
+
+  useEffect(() => {
+    if (data?.rating != null) {
+      setRating(data.rating)
+    }
+  }, [data])
+
+  const handleRatingChange = async (newRating) => {
+    if (!walkId || !apiFetch || shareToken) return
+    try {
+      const res = await apiFetch(`/api/walks/${encodeURIComponent(walkId)}/rate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rating: newRating })
+      })
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}))
+        throw new Error(payload.detail || 'Failed to update rating')
+      }
+      setRating(newRating)
+      setData(prev => prev ? { ...prev, rating: newRating } : prev)
+      if (onRenamed) onRenamed()
+    } catch (err) {
+      alert(err.message || 'Failed to update rating')
+    }
+  }
 
   const payload = data?.payload || {}
   const stressSummary = data?.payload?.stressAnalytics?.summary || {}
@@ -914,10 +973,82 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
   return (
     <section className="analysis-view">
       <section className="card analysis-header-card">
-        <h2 style={{ fontSize: '1.4rem', fontWeight: 700, letterSpacing: 'normal', textTransform: 'none', color: 'var(--text)', marginBottom: '0.35rem' }}>
-          {walkTitle}
-        </h2>
+        {isEditingName ? (
+          <form onSubmit={handleRenameSubmit} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginBottom: '0.5rem' }}>
+            <input
+              type="text"
+              value={editedName}
+              onChange={e => setEditedName(e.target.value)}
+              style={{
+                fontSize: '1.2rem',
+                fontWeight: 700,
+                padding: '0.3rem 0.6rem',
+                borderRadius: '4px',
+                border: '1px solid var(--border)',
+                background: 'var(--bg)',
+                color: 'var(--text)',
+                flex: '1',
+                maxWidth: '400px'
+              }}
+              placeholder="Walk name"
+              autoFocus
+            />
+            <button className="btn-primary" type="submit" style={{ padding: '0.3rem 0.8rem', fontSize: '0.9rem' }}>Save</button>
+            <button className="btn-secondary" type="button" onClick={() => { setIsEditingName(false); setEditedName(data.name || data.date || '') }} style={{ padding: '0.3rem 0.8rem', fontSize: '0.9rem' }}>Cancel</button>
+          </form>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.35rem' }}>
+            <h2 style={{ fontSize: '1.4rem', fontWeight: 700, letterSpacing: 'normal', textTransform: 'none', color: 'var(--text)', margin: 0 }}>
+              {walkTitle}
+            </h2>
+            {!shareToken && (
+              <button
+                onClick={() => setIsEditingName(true)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  padding: '4px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  opacity: 0.6
+                }}
+                title="Rename walk"
+              >
+                ✏️
+              </button>
+            )}
+          </div>
+        )}
         <p className="analysis-subtitle">{subtitleParts.join(' · ')}</p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginTop: '0.35rem' }}>
+          <span className="analysis-subtitle" style={{ fontSize: '0.9rem' }}>Rating:</span>
+          <div style={{ display: 'inline-flex', gap: '0.15rem' }}>
+            {[1, 2, 3, 4, 5].map((star) => {
+              const active = star <= rating
+              return (
+                <button
+                  key={star}
+                  type="button"
+                  onClick={() => handleRatingChange(star)}
+                  disabled={Boolean(shareToken)}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    cursor: shareToken ? 'default' : 'pointer',
+                    padding: '0.1rem',
+                    fontSize: '1.25rem',
+                    opacity: active ? 1 : 0.25,
+                    transition: 'opacity 0.15s ease'
+                  }}
+                  title={shareToken ? `Rated ${rating}/5` : `Rate ${star} stars`}
+                >
+                  ⭐
+                </button>
+              )
+            })}
+          </div>
+        </div>
         {!shareToken && (
           <>
             <div style={{ marginTop: '0.7rem', display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
@@ -1508,64 +1639,50 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
         </section>
       )}
 
-      {analysisTab === 'general' ? (
-        <section className="card">
-          <h2>Stress Summary</h2>
-          <div className="analysis-summary-row">
-            <span>Decoupling score:</span>
-            <strong>{fmt(stressSummary.score, 0)}{stressSummary.band ? ` (${stressSummary.band})` : ''}</strong>
-          </div>
-          <div className="analysis-summary-row">
-            <span>Elevated minutes:</span>
-            <strong>{fmt(stressSummary.elevated_minutes, 0, ' min')}</strong>
-          </div>
-          <div className="analysis-summary-row">
-            <span>Max residual:</span>
-            <strong>{fmt(stressSummary.max_residual_bpm, 1, ' bpm')}</strong>
-          </div>
-        </section>
-      ) : !hasInsulin ? (
-        <section className="card">
-          <h2>Glucose Summary</h2>
-          <div className="analysis-summary-row">
-            <span>Time in target (4.0–8.0 mmol/L):</span>
-            <strong>{fmt(metrics.tir_pct, 0, '%')}</strong>
-          </div>
-          <div className="analysis-summary-row">
-            <span>Glucose change:</span>
-            <strong style={{ color: metrics.bg_delta < 0 ? '#1f8a5b' : metrics.bg_delta > 0 ? '#d16a00' : 'inherit' }}>
-              {metrics.bg_delta > 0 ? '+' : ''}{fmt(metrics.bg_delta, 1, ' mmol/L')}
-            </strong>
-          </div>
-        </section>
-      ) : (
-        <section className="card">
-          <h2>Diabetes Summary</h2>
-          <div className="analysis-summary-row">
-            <span>Insulin stress multiplier:</span>
-            <strong>{fmt(insulinStressSummary.stress_multiplier, 2, 'x')}{insulinStressSummary.band ? ` (${insulinStressSummary.band})` : ''}</strong>
-          </div>
-          <div className="analysis-summary-row">
-            <span>IOB overlap:</span>
-            <strong>{fmt(insulinStressSummary.overlap_minutes, 0, ' min')}</strong>
-          </div>
-          <div className="analysis-summary-row">
-            <span>Peak IOB proxy:</span>
-            <strong>{fmt(insulinStressSummary.peak_iob_units_proxy, 2, ' U')}</strong>
-          </div>
-          {hasPump && (
-            <>
-              <div className="analysis-summary-row">
-                <span>SmartGuard predicted-low suspend:</span>
-                <strong>{fmt(smartguardSummary.predicted_low_suspend_count, 0)}</strong>
-              </div>
-              <div className="analysis-summary-row">
-                <span>SmartGuard suspend/resume:</span>
-                <strong>{fmt(smartguardSummary.suspend_count, 0)} / {fmt(smartguardSummary.resume_count, 0)}</strong>
-              </div>
-            </>
-          )}
-        </section>
+      {analysisTab === 'diabetes' && (
+        !hasInsulin ? (
+          <section className="card">
+            <h2>Glucose Summary</h2>
+            <div className="analysis-summary-row">
+              <span>Time in target (4.0–8.0 mmol/L):</span>
+              <strong>{fmt(metrics.tir_pct, 0, '%')}</strong>
+            </div>
+            <div className="analysis-summary-row">
+              <span>Glucose change:</span>
+              <strong style={{ color: metrics.bg_delta < 0 ? '#1f8a5b' : metrics.bg_delta > 0 ? '#d16a00' : 'inherit' }}>
+                {metrics.bg_delta > 0 ? '+' : ''}{fmt(metrics.bg_delta, 1, ' mmol/L')}
+              </strong>
+            </div>
+          </section>
+        ) : (
+          <section className="card">
+            <h2>Diabetes Summary</h2>
+            <div className="analysis-summary-row">
+              <span>Insulin stress multiplier:</span>
+              <strong>{fmt(insulinStressSummary.stress_multiplier, 2, 'x')}{insulinStressSummary.band ? ` (${insulinStressSummary.band})` : ''}</strong>
+            </div>
+            <div className="analysis-summary-row">
+              <span>IOB overlap:</span>
+              <strong>{fmt(insulinStressSummary.overlap_minutes, 0, ' min')}</strong>
+            </div>
+            <div className="analysis-summary-row">
+              <span>Peak IOB proxy:</span>
+              <strong>{fmt(insulinStressSummary.peak_iob_units_proxy, 2, ' U')}</strong>
+            </div>
+            {hasPump && (
+              <>
+                <div className="analysis-summary-row">
+                  <span>SmartGuard predicted-low suspend:</span>
+                  <strong>{fmt(smartguardSummary.predicted_low_suspend_count, 0)}</strong>
+                </div>
+                <div className="analysis-summary-row">
+                  <span>SmartGuard suspend/resume:</span>
+                  <strong>{fmt(smartguardSummary.suspend_count, 0)} / {fmt(smartguardSummary.resume_count, 0)}</strong>
+                </div>
+              </>
+            )}
+          </section>
+        )
       )}
 
       {/* Glucose Risk Profile */}
@@ -1882,39 +1999,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
         </section>
       )}
 
-      {analysisTab === 'general' && (
-        <section className="card">
-          <h2>Recent Stress Trend</h2>
-          {!trendRows.length ? (
-            <p className="empty">No trend rows available yet.</p>
-          ) : (
-            <div className="trend-table-wrap">
-              <table className="trend-table">
-                <thead>
-                  <tr>
-                    <th>Date</th>
-                    <th>Walk</th>
-                    <th>Score</th>
-                    <th>Band</th>
-                    <th>Elevated min</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {trendRows.map((row) => (
-                    <tr key={`${row.walk_id}-${row.start_time || row.date || ''}`}>
-                      <td>{row.date || 'n/a'}</td>
-                      <td>{row.name || row.walk_id || 'n/a'}</td>
-                      <td>{fmt(row.score, 0)}</td>
-                      <td>{row.band || 'n/a'}</td>
-                      <td>{fmt(row.elevated_minutes, 0)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      )}
+
     </section>
   )
 }

@@ -12,8 +12,15 @@ from .db import (
     get_user_settings,
     upsert_user_settings,
     delete_user_data,
+    insert_system_log,
+    query_system_logs,
+    get_logs_summary,
+    clear_system_logs,
+    update_walk_id_references,
 )
 from .service import list_walk_analytics, persist_walk_analytics, refresh_walk_analytics_if_needed
+from .logging_service import WalkiesDBLogHandler, log_system_event, classify_log_event
+from .migrate import migrate_walk_ids_to_uuids
 
 __all__ = [
     "ANALYTICS_VERSION",
@@ -32,4 +39,14 @@ __all__ = [
     "get_user_settings",
     "upsert_user_settings",
     "delete_user_data",
+    "insert_system_log",
+    "query_system_logs",
+    "get_logs_summary",
+    "clear_system_logs",
+    "update_walk_id_references",
+    "migrate_walk_ids_to_uuids",
+    "WalkiesDBLogHandler",
+    "log_system_event",
+    "classify_log_event",
 ]
+

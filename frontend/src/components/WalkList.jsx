@@ -34,12 +34,19 @@ function WalkCard({ walk, onDeleted, onView, apiFetch }) {
     if (res.ok) onDeleted()
   }
 
+  const rating = walk.rating || 3
+
   return (
     <article className="walk-card">
       <div className="walk-header">
         <div className="walk-title">
           {walk.name && <h3>{walk.name}</h3>}
-          <span className={walk.name ? 'walk-date-sub' : 'walk-date-main'}>{walk.date}</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span className={walk.name ? 'walk-date-sub' : 'walk-date-main'}>{walk.date}</span>
+            <span style={{ fontSize: '0.9rem', color: '#ffd700' }} title={`Rated ${rating}/5`}>
+              {'★'.repeat(rating)}{'☆'.repeat(5 - rating)}
+            </span>
+          </div>
         </div>
         <div className="walk-actions">
           <button className="btn-secondary" onClick={() => onView(walk.id)}>View analysis</button>
