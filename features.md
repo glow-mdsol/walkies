@@ -49,10 +49,10 @@ Generate a self-contained `.html` file for a walk (embedding Plotly charts, the 
 
 ## Data Source Support
 
-### Automated Ingestion
+### DONE - Automated Ingestion (Garmin Connect)
 Allow a user to connect to the upstream systems and pull data in automatically.  This should be done in a way that is secure and private.  The user should be able to select which data source to use for a given walk.  The data source should be displayed on the Walk Analysis View when the user is viewing a walk.   It's possible there are existing APIs/libraries for automated ingestion.  Do some research on the best way to implement this.
 
-Make sure that a user's credentials are secure and private.  I would suggest that the user stores their credentials in the app, and only the app has access to them.
+Make sure that a user's credentials are secure and private.  I would suggest that the user stores their credentials in the app, and only the app has access to them. We use session tokens on persistent storage via python-garminconnect to securely fetch walking/hiking FIT files automatically.
 
 
 ### Support Dexcom CSV imports
@@ -81,12 +81,13 @@ In addition to selecting the data source, the user should be able to enter their
 
 This information should be stored in the database and used to provide personalized insights and recommendations to the user.  It should also be displayed on the Walk Analysis View when the user is viewing a walk.  The treatment plan should be displayed in a way that is easy to understand and use.  The treatment plan should also be used to calculate the expected BG drop during a walk and compare it to the actual BG drop.  This will allow the user to see if their treatment plan is effective and if they need to make any adjustments.
 
-### Automated extraction of Data Sources
-The source data is extracted from data portals (eg Garmin Connect, Carelink).  Investigate whether it is possible to automate the extraction of this data.  Do they make available a API that can be used to extract the data?  Are there libraries that can be used to extract the data?  
+### DONE - Automated extraction of Data Sources
+The source data is extracted from data portals (eg Garmin Connect, Carelink). We support automated ingestion for:
+1. **Garmin Connect**: Automatic synchronization of walking FIT files using `python-garminconnect` with multi-factor authentication support.
+2. **Medtronic CareLink**: Automated CGM and insulin event sync via `carelink-python-client` using uploaded connection token files.
 
-It should be possible to have a button on the Dashboard to allow the user to "pull" the latest data from the data sources.  If the data is available, it should be added to the database and the user should be notified that the data has been added.  The data should be added to the database in a way that is easy to understand and use.  The data should also be used to provide personalized insights and recommendations to the user.  The user should be able to select which data source to use for a given walk.  The data source should be displayed on the Walk Analysis View when the user is viewing a walk.   
-
-Ensure that if credentials are required, these are protected to the highest level.
+There is a button on the Dashboard allowing users to "pull" the latest data from these sources to update walk analytics.
+Credentials and session tokens are stored securely in the user's workspace directory.
 
 ---
 
@@ -167,7 +168,7 @@ Currently any file can be uploaded. Add frontend + backend validation: accept on
 Add a CSS dark-mode variant using the existing CSS custom properties (`--primary`, `--bg` etc.). Toggle via a button in the header, persisted to `localStorage`.
 
 
-### Deploy the application
+### DONE - Deploy the application
 We need to deploy the app so people can use it. This should be something that can be triggered via github actions or similar.  This is a fun app, so the hosting environment should be economical.  
 We need to add:
 * A landing page 
