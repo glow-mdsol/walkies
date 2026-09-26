@@ -1,134 +1,177 @@
 # Deployment Guide
 
-The GCP + Firebase + Neon walkthrough lives in `README.md`. This document covers the decisions behind those choices, the health-data considerations that affect which options are safe to use, and what to watch for on free tiers.
+This guide covers production deployment options for Walkies, step-by-step instructions for deploying to Google Cloud Platform (GCP) with Firebase Hosting and Neon PostgreSQL, health-data privacy considerations, and self-hosting alternatives.
 
 ---
 
-## What data this app stores
+## 1. Production Deployment (GCP + Firebase + Neon)
 
-| Data type | Where | Sensitivity |
+Walkies can be deployed to Google Cloud Platform (GCP) entirely within their free tier boundaries using Google Cloud Run, Firebase Hosting, Google Cloud Storage, and a serverless PostgreSQL database (e.g., Neon.tech).
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   Production Architecture                │
+├───────────────────────┬─────────────────────────────────┤
+│ Frontend              │ Firebase Hosting (Global CDN)   │
+│ Backend API           │ Google Cloud Run (Container)    │
+│ Analytics / Metadata  │ Neon Serverless PostgreSQL      │
+│ File Storage          │ Google Cloud Storage (Bucket)   │
+│ CI/CD Pipeline        │ GitHub Actions Workflow         │
+└───────────────────────┴─────────────────────────────────┘
+```
+
+### Prerequisites
+
+- [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) (`gcloud` CLI) installed and authenticated (`gcloud auth login`).
+- A Google Cloud Project created (note the **Project ID**).
+- A free PostgreSQL database account at [Neon](https://neon.tech/) to get a connection string.
+- Google OAuth 2.0 Client ID created in Google Cloud Console.
+
+### Step 1: Provision GCP Resources
+
+A helper script (`deploy.sh`) is provided in the repository root to configure required GCP services and IAM permissions.
+
+Run it from your terminal:
+
+```bash
+chmod +x deploy.sh
+./deploy.sh <YOUR_PROJECT_ID> <YOUR_REGION>
+```
+
+*Note: If no region is provided, it defaults to `us-central1`.*
+
+The script will:
+1. Enable necessary GCP APIs (Cloud Run, Artifact Registry, Cloud Storage, IAM).
+2. Create an Artifact Registry repository (`walkies-repo`) for Docker container images.
+3. Create a Cloud Storage bucket (`gs://walkies-data-<project-id>`) for durable `.fit`, `.csv`, and `.gpx` file storage.
+4. Create a deployment Service Account (`walkies-deployer`) with required IAM roles.
+5. Generate a credentials key file (`walkies-deployer-key.json`) for GitHub Actions.
+
+### Step 2: Initialize Firebase Hosting
+
+1. Go to the [Firebase Console](https://console.firebase.google.com/).
+2. Select your existing GCP project.
+3. Navigate to **Hosting** and click **Get Started** to initialize hosting.
+
+### Step 3: Configure GitHub Secrets
+
+In your GitHub repository, go to **Settings > Secrets and variables > Actions** and add the following repository secrets:
+
+| Secret Name | Description |
+|---|---|
+| `GCP_PROJECT_ID` | Your Google Cloud project ID |
+| `GCP_SA_KEY` | Entire JSON content of `walkies-deployer-key.json` |
+| `GCP_REGION` | GCP region (e.g. `us-central1` or `europe-west1`) |
+| `GOOGLE_CLIENT_ID` | Google OAuth 2.0 Client ID |
+| `ANALYTICS_DB_URL` | Neon PostgreSQL connection string (with SSL mode) |
+
+> [!CAUTION]
+> After saving `GCP_SA_KEY` in GitHub Secrets, securely delete `walkies-deployer-key.json` from your local machine. Never commit service account keys to source control.
+
+### Step 4: Deploy via GitHub Actions
+
+Push changes to the `main` branch of your repository. The GitHub Actions workflow in `.github/workflows/deploy.yml` will automatically build container images, deploy Cloud Run services, and publish frontend assets to Firebase Hosting.
+
+### Step 5: Post-Deployment Configuration
+
+1. **Authorized OAuth Origins**:
+   - Open Google Cloud Console > **APIs & Services** > **Credentials**.
+   - Under your OAuth 2.0 Client ID, add your Firebase Hosting URL (e.g., `https://<project-id>.web.app` and `https://<project-id>.firebaseapp.com`) to **Authorized JavaScript Origins** and **Authorized Redirect URIs**.
+2. **Database Migrations**:
+   - Run the migration task against the production database:
+   ```bash
+   export ANALYTICS_DB_URL="postgresql://user:password@host/dbname?sslmode=require"
+   task analytics:migrate
+   ```
+
+---
+
+## 2. Health Data & Regulatory Considerations
+
+### What Data This App Stores
+
+| Data Type | Storage Location | Sensitivity |
 |---|---|---|
-| CGM glucose readings (mmol/L, timestamped) | DB + raw Carelink CSV | High — health data |
-| Insulin doses and bolus events | DB + raw Carelink CSV | High — health data |
-| GPS tracks and activity points | DB + raw FIT file | Medium — location |
-| Heart rate, cadence, distance | DB + raw FIT file | Medium |
-| Analytics cache (TiR, drop rate, risk profile) | DB | High — derived health data |
-| Share tokens (for HCP / caregiver access) | DB | Medium |
-| Google OAuth sub identifier | DB | Low — no PII beyond identifier |
+| CGM glucose readings (mmol/L, timestamped) | DB + raw Carelink CSV | **High** — health data |
+| Insulin doses and bolus events | DB + raw Carelink CSV | **High** — health data |
+| GPS tracks and activity points | DB + raw FIT file | **Medium** — location |
+| Heart rate, cadence, distance | DB + raw FIT file | **Medium** |
+| Analytics cache (TiR, drop rate, risk profile) | DB | **High** — derived health data |
+| Share tokens (for HCP / caregiver access) | DB | **Medium** |
+| Google OAuth sub identifier | DB | **Low** — identifier only |
 
-The raw files (.csv, .fit) in Cloud Storage and the analytics rows in PostgreSQL together constitute a **health dataset** under UK GDPR (and would be PHI under US HIPAA if this were a covered entity, which it is not — see below).
+The raw files (`.csv`, `.fit`) in Cloud Storage and analytics rows in PostgreSQL together constitute a **health dataset** under UK GDPR.
 
----
+### Regulatory Position
 
-## Regulatory position
+#### UK GDPR
+- Health data is **Special Category data** (Article 9).
+- For personal use, an individual is both the **data controller** and **data processor** for their own data (no ICO registration needed for pure personal processing).
+- The moment a third party accesses the data (e.g., sharing a route or glycemic report with an endocrinologist or caregiver), lawful basis requirements apply (Article 9(2)(a) — explicit consent).
+- Cloud storage/database providers act as **data processors** under UK GDPR and should ideally execute a **Data Processing Agreement (DPA)**.
 
-### UK GDPR
-
-Geoffrey is a UK resident; this app processes his health data. Under UK GDPR, health data is **Special Category data** (Article 9). As the data subject *and* the person operating the system, Geoffrey is both the **data controller** and the **data processor** for his own data.
-
-Key points:
-- There is no requirement to file with the ICO for processing your own personal data for personal use.
-- The moment a third party can access the data (e.g., a caregiver or HCP clicking a share link), the controller/processor relationship extends to them as recipients.
-- Any cloud provider used to store the data is a **data processor** under UK GDPR and should ideally sign a **Data Processing Agreement (DPA)**.
-
-### HIPAA (US)
-
-HIPAA applies to **covered entities** (healthcare providers, insurers, clearinghouses) and their **business associates**. An individual managing their own health data for personal use is **not a covered entity**. HIPAA does not apply here. This does not diminish the sensitivity of the data — it only means there is no statutory obligation to obtain a BAA.
-
-### Practical implication
-
-The DPA point matters if you ever invite an endocrinologist or caregiver to view share links:
-
-> Once health data is accessible to a third party, UK GDPR Article 9 processing requirements apply to that disclosure, and a lawful basis must exist (Article 9(2)(a) — explicit consent of the data subject is the most natural basis here, since Geoffrey consents to sharing his own health data).
+#### HIPAA (US)
+HIPAA applies to **covered entities** (hospitals, insurers, clearinghouses) and business associates. Individuals managing their personal health data are not covered entities. While statutory HIPAA obligations do not apply directly, data sensitivity remains critical.
 
 ---
 
-## Concerns with free database providers
+## 3. Database Provider Evaluation & Free Tier Caveats
 
-| Provider | Free tier | Will sign a DPA? | Data region | Verdict |
+| Provider | Free Tier | DPA Availability | Region Selection | Recommendation |
 |---|---|---|---|---|
-| **Neon** (current) | 0.5 GB, US-East-1 or EU-West | ✅ DPA available (Pro plan required for BAA/DPA execution) | US or EU selectable | ⚠️ Free tier: no executed DPA; Pro ($19/mo) unlocks it. EU region available. |
-| **Supabase** | 500 MB, 2 projects | ❌ No DPA on free tier | US (AWS us-east-1) | ❌ Not suitable for health data without upgrade |
-| **PlanetScale** | Discontinued free tier | N/A | N/A | N/A |
-| **Turso** (SQLite-edge) | 9 GB, 500 DBs | ❌ No DPA on free tier | Various | ❌ Not suitable for health data without upgrade |
-| **CockroachDB** | 10 GB | ✅ DPA available on free tier | EU selectable | ✅ Acceptable — DPA available, EU region option |
-| **Self-hosted SQLite on VPS** | Cost of VPS (~£3–5/mo Hetzner) | N/A — you control the server | EU (Hetzner has Helsinki, Nuremberg) | ✅ Best option for data sovereignty |
+| **Neon** (Current) | 0.5 GB | ✅ DPA on Pro plan ($19/mo) | US or EU selectable | ⚠️ Free tier for solo personal use; Pro plan for DPA / EU residency. |
+| **CockroachDB** | 10 GB | ✅ DPA available on free tier | EU selectable | ✅ Acceptable — DPA available, EU region option. |
+| **Supabase** | 500 MB | ❌ No DPA on free tier | US (AWS us-east-1) | ❌ Not recommended without paid upgrade. |
+| **Self-Hosted VPS** | Disk size | N/A — you control the server | UK / EU (e.g. Hetzner) | ✅ **Best option for data sovereignty.** |
 
-### The core problem with free tiers
-
-Free tiers are designed for hobby projects, not health data. Common issues:
-
-1. **No DPA / data processing agreement.** The provider can inspect, migrate, or delete your data under their own terms. Most explicitly exclude health/biometric data from their acceptable use policy on free tiers.
-2. **Data residency defaults to the US.** Free Neon and Supabase instances land on `us-east-1`. UK GDPR requires that data transferred outside the UK/EEA has adequate protection (US adequacy decision is in flux post-Schrems II; UK has its own International Data Transfer Agreement framework).
-3. **No audit log / access controls.** Who at Neon can query your glucose readings? Free tiers have no SLA or access transparency.
-4. **Ephemeral storage risk.** Free tiers can suspend inactive instances and delete data after 30–90 days of inactivity.
+### Core Risks of Free Database Tiers
+1. **No Executed DPA**: Free tiers rarely include signed data processing agreements and may exclude health data in Acceptable Use Policies.
+2. **Default US Data Residency**: Free tiers often allocate resources to US regions by default.
+3. **Inactivity Suspension**: Free instances may be suspended or purged after periods of inactivity.
 
 ---
 
-## Recommended deployment paths
+## 4. Deployment Architecture Options
 
-### Option A — Current stack (GCP + Neon free tier)
+### Option A — GCP + Neon Free Tier (Personal Solo Use)
+Suitable for solo personal tracking where no third parties access the data.
 
-**Acceptable for personal solo use where no third party accesses the data.** The moment you share a walk link with an HCP or caregiver, you should move to Option B or C.
+*Recommended mitigations*:
+- Select `eu-west` (Frankfurt) when creating the Neon database.
+- Rotate Cloud Run service account keys regularly.
+- Ensure Cloud Storage bucket permissions are strictly private.
 
-Mitigations if staying on free Neon:
-- Set Neon region to `eu-west` (Frankfurt) at project creation, not `us-east`.
-- Encrypt the raw Carelink CSVs before uploading to GCS (`CSEK` customer-supplied encryption keys).
-- Rotate the Cloud Run service account key regularly.
-- Do not store the `walkies-deployer-key.json` anywhere after adding it to GitHub Secrets.
-
-### Option B — GCP + Neon Pro (EU) — recommended if sharing with HCPs
-
-Switch Neon to a paid plan (starts at $19/mo) to gain:
+### Option B — GCP + Neon Pro EU (Recommended for HCP Sharing)
+Upgrading Neon to a paid plan unlocks:
 - Executed DPA from Neon.
-- EU region (Frankfurt) for data residency.
-- Point-in-time recovery for the analytics DB.
+- Guaranteed EU data residency.
+- Point-in-time recovery for the analytics database.
 
-No change to the deployment pipeline — just update `ANALYTICS_DB_URL`.
+### Option C — Self-Hosted VPS (Best for Complete Data Sovereignty)
+Run the entire stack on a dedicated VPS (e.g., Hetzner CX22, ~£4/mo):
 
-### Option C — Self-hosted VPS (best for data sovereignty)
-
-Run the full stack on a Hetzner CX22 (Helsinki, EU, ~£4/mo):
-
-```
-Docker Compose
-├── backend (FastAPI, Cloud Run → Docker on VPS)
-├── frontend (served by Caddy with auto-HTTPS)
-└── postgres (or keep SQLite — no external dependency)
+```text
+Docker Compose Stack
+├── backend (FastAPI)
+├── frontend (Served via Caddy / Nginx with auto-HTTPS)
+└── postgres (or local SQLite file mount)
 ```
 
-Advantages:
-- You control the disk; no provider can access your data.
-- SQLite works fine for one user — no Postgres required.
-- Caddy handles HTTPS automatically via Let's Encrypt.
-- No free-tier inactivity timeouts.
-- Total cost: ~£4–5/mo.
+**Advantages**:
+- Full data sovereignty with complete control over storage disks.
+- SQLite or PostgreSQL run locally without third-party database dependencies.
+- Automated HTTPS certificates via Let's Encrypt / Caddy.
+- Predictable performance with no serverless cold starts or inactivity timeouts.
 
-The walk file storage (currently GCS) can be replaced with a local volume mount — GCS is only needed for durability and CDN when running serverless (Cloud Run).
-
-### Option D — Keep it local (development only)
-
-`task dev` against `backend/data/` and a local SQLite file is already private by design. This is the zero-risk option if the app is only ever run on your own machine.
+### Option D — Local Only (Zero Cloud Exposure)
+Run `task dev` locally against `backend/data/` with local SQLite storage. All health records remain on your local machine with zero external network transmission.
 
 ---
 
-## File storage (Cloud Storage)
+## 5. File Storage Security (Cloud Storage)
 
-The raw Carelink CSVs and FIT files in the GCS bucket are the highest-sensitivity assets — they are the complete, unprocessed health record. Recommendations:
-
-- Enable **Object Versioning** on the bucket so files are recoverable.
-- Set **Uniform bucket-level access** (no ACLs) and ensure the bucket is not public.
-- Consider **customer-managed encryption keys (CMEK)** via Cloud KMS if you move to Option B/C — this means Google cannot decrypt the files at rest without your key.
-- Do **not** set a lifecycle delete policy below 90 days.
-
----
-
-## Summary
-
-| Concern | Risk level | Mitigation |
-|---|---|---|
-| No DPA on Neon free tier | Medium (personal use) → High (if sharing) | Move to Neon Pro or self-host before sharing |
-| Data in US region | Low (personal) → Medium (GDPR sharing) | Set Neon region to EU at creation; or self-host |
-| Raw files unencrypted at rest in GCS | Low (access-controlled by IAM) | CMEK for higher assurance |
-| Free tier inactivity suspension | Medium | Upgrade or self-host; schedule a weekly keep-alive ping |
-| No audit trail on DB access | Low (personal) | Acceptable for personal use; upgrade if sharing with HCPs |
+Raw CareLink CSVs and Garmin FIT files contain unredacted medical and location records. For cloud deployments:
+- **Enable Object Versioning** to prevent accidental deletion or corruption.
+- **Enforce Uniform Bucket-Level Access** to prevent unintended public object ACLs.
+- **Customer-Managed Encryption Keys (CMEK)**: For high-security environments, encrypt storage buckets with Cloud KMS keys.
+- Avoid aggressive lifecycle deletion policies (retain data >= 90 days).
