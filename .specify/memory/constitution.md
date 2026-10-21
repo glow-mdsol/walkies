@@ -77,6 +77,19 @@ or MDI).
 normalizing multi-vendor telemetry enables holistic, day-to-day glycemic and activity correlation
 for a broad diabetic user base.
 
+### VII. Evidence-Based Design & Scientific Literature Review (NON-NEGOTIABLE)
+Every physiological, glycemic, pharmacokinetic, or exertion analysis introduced or modified in
+Walkies MUST be grounded in a thorough, documented review of peer-reviewed scientific and clinical
+literature (utilizing repository research digests in `sources/` / `backend/sources_review/` and
+current academic databases such as PubMed, Europe PMC, and OpenAlex). Before implementing any new
+analytical model or correlation metric, Phase 0 research (`research.md`) MUST cite the current
+clinical consensus, physiological mechanisms, and empirical thresholds supporting the formulation,
+and explicitly document any heuristic approximations or non-diagnostic caveats presented to the
+user.
+
+*Rationale*: Speculative or unverified math in diabetes and exercise physiology can mislead users;
+anchoring all analyses in peer-reviewed evidence ensures Walkies reflects current clinical science.
+
 ## Clinical & Technical Constraints
 
 - **Backend Stack**: Python managed exclusively via `uv`, FastAPI, and SQLite/PostgreSQL persistence
@@ -87,6 +100,9 @@ for a broad diabetic user base.
   timestamp alignment (including 5-bit compressed timestamp rollover for binary FIT streams); CGM
   and pump extracts (CareLink `.csv`, Dexcom, etc.) MUST normalize glucose readings to `mmol/L`
   and preserve event metadata across both closed-loop pump and non-pump (MDI/CGM-only) regimens.
+- **Literature & Evidence Tooling**: Research reviews MUST leverage `backend/sources_review` and
+  indexed clinical literature (ATTD International Consensus on Time in Range, EASD/ISPAD/ADA
+  exercise management guidelines) to validate metrics and thresholds.
 - **Cost & Portability**: Dependencies MUST favor open-source libraries and containerized deployment
   (Docker / Google Cloud Run) with minimal infrastructure overhead.
 - **Observability**: Application events, provider sync statuses, and parsing errors MUST be
@@ -95,13 +111,16 @@ for a broad diabetic user base.
 
 ## Development Workflow & Quality Gates
 
-1. **Branching**: Create a dedicated branch from `main` before starting any implementation work.
-2. **Local Verification**: Use `WALKIES_DEV_BYPASS_AUTH=1` for local development testing when OAuth
+1. **Literature Review Gate**: Before designing or coding new physiological or glycemic models,
+   conduct and document a literature review in `research.md` (with citations/DOIs/PMIDs) verifying
+   alignment with current clinical consensus.
+2. **Branching**: Create a dedicated branch from `main` before starting any implementation work.
+3. **Local Verification**: Use `WALKIES_DEV_BYPASS_AUTH=1` for local development testing when OAuth
    is not required.
-3. **Test Gate**: Run `uv run pytest -v` from `backend/` and ensure 100% of the test suite passes.
-4. **Build Gate**: Run `npm --prefix frontend run build` to verify frontend compilation when UI
+4. **Test Gate**: Run `uv run pytest -v` from `backend/` and ensure 100% of the test suite passes.
+5. **Build Gate**: Run `npm --prefix frontend run build` to verify frontend compilation when UI
    components or styles are touched.
-5. **Documentation Alignment**: Keep `AGENTS.md`, `CLAUDE.md`, and `Analysis.md` synchronized when
+6. **Documentation Alignment**: Keep `AGENTS.md`, `CLAUDE.md`, and `Analysis.md` synchronized when
    introducing new API endpoints, provider integrations, database tables, or clinical metrics.
 
 ## Governance
@@ -119,7 +138,7 @@ defined herein.
     guidance.
   - **PATCH**: Wording clarifications, formatting refinements, or non-semantic fixes.
 - **Compliance Review**: Every implementation plan generated via `/speckit-plan` MUST evaluate its
-  Constitution Check gates against these six Core Principles before Phase 0 research and after
+  Constitution Check gates against these seven Core Principles before Phase 0 research and after
   Phase 1 design. Runtime development guidance is maintained in `AGENTS.md` and `CLAUDE.md`.
 
-**Version**: 1.1.0 | **Ratified**: 2026-10-22 | **Last Amended**: 2026-10-22
+**Version**: 1.2.0 | **Ratified**: 2026-10-22 | **Last Amended**: 2026-10-22
