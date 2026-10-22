@@ -1,3 +1,14 @@
+<!--
+Sync Impact Report
+- Version change: 1.2.0 → 1.3.0
+- Modified principles:
+  - V. Discrete Scope & Branch Discipline → V. Discrete Scope, Branch & Pull Request Discipline (NON-NEGOTIABLE)
+- Modified sections:
+  - Development Workflow & Quality Gates (added mandatory Pull Request Gate prohibiting direct commits or local fast-forward merges into `main` for feature updates)
+- Added sections: None
+- Removed sections: None
+- Follow-up TODOs: None
+-->
 # Walkies Constitution
 
 ## Core Principles
@@ -53,15 +64,17 @@ bundling errors prior to merge.
 *Rationale*: Automated verification and strict mocking prevent regressions in binary/CSV/API
 parsers and guarantee fast, offline-capable, deterministic CI/CD pipelines.
 
-### V. Discrete Scope & Branch Discipline
+### V. Discrete Scope, Branch & Pull Request Discipline (NON-NEGOTIABLE)
 All development MUST occur on dedicated, short-lived feature or fix branches (`feat/...`,
-`fix/...`, `refactor/...`). Pull requests and implementation tasks MUST maintain strict scope
-boundaries and avoid feature creep or unrequested opportunistic refactoring. Unrelated enhancements
-discovered during implementation MUST be recorded in `features.md` rather than bundled into the
-active branch.
+`fix/...`, `refactor/...`, or numbered Spec Kit feature branches). Feature updates, bug fixes, and
+refactors MUST ALWAYS be submitted and integrated into `main` via a Pull Request (PR) rather than
+committing directly to `main` or merging locally without a PR. Pull requests and implementation
+tasks MUST maintain strict scope boundaries and avoid feature creep or unrequested opportunistic
+refactoring. Unrelated enhancements discovered during implementation MUST be recorded in
+`features.md` rather than bundled into the active branch.
 
-*Rationale*: Atomic, tightly scoped changes keep code reviews tractable and prevent destabilizing
-core clinical and parsing workflows.
+*Rationale*: Enforcing Pull Requests for all feature updates guarantees reviewable diffs, CI gate
+verification, and an auditable history before changes reach `main`.
 
 ### VI. Direct Provider Integration & Multi-Modal Telemetry (USP)
 Walkies' core Unique Selling Proposition (USP) is frictionless, direct integration with wearable
@@ -98,8 +111,10 @@ anchoring all analyses in peer-reviewed evidence ensures Walkies reflects curren
   multi-panel physiological and aggregate daily visualizations.
 - **Telemetry & Parsing Standards**: Garmin `.fit` files and wellness epochs MUST preserve accurate
   timestamp alignment (including 5-bit compressed timestamp rollover for binary FIT streams); CGM
-  and pump extracts (CareLink `.csv`, Dexcom, etc.) MUST normalize glucose readings to `mmol/L`
-  and preserve event metadata across both closed-loop pump and non-pump (MDI/CGM-only) regimens.
+  and pump extracts (CareLink `.csv`, Dexcom, Tandem, etc.) MUST normalize glucose readings to
+  `mmol/L` for canonical backend storage (while supporting user-configurable `mmol/L` or `mg/dL`
+  display units) and preserve event metadata across closed-loop pump, standard pump, MDI, and
+  non-insulin regimens.
 - **Literature & Evidence Tooling**: Research reviews MUST leverage `backend/sources_review` and
   indexed clinical literature (ATTD International Consensus on Time in Range, EASD/ISPAD/ADA
   exercise management guidelines) to validate metrics and thresholds.
@@ -114,14 +129,19 @@ anchoring all analyses in peer-reviewed evidence ensures Walkies reflects curren
 1. **Literature Review Gate**: Before designing or coding new physiological or glycemic models,
    conduct and document a literature review in `research.md` (with citations/DOIs/PMIDs) verifying
    alignment with current clinical consensus.
-2. **Branching**: Create a dedicated branch from `main` before starting any implementation work.
+2. **Branching**: Create a dedicated feature or fix branch from `main` before starting any
+   implementation work; never commit feature work directly to `main`.
 3. **Local Verification**: Use `WALKIES_DEV_BYPASS_AUTH=1` for local development testing when OAuth
    is not required.
 4. **Test Gate**: Run `uv run pytest -v` from `backend/` and ensure 100% of the test suite passes.
 5. **Build Gate**: Run `npm --prefix frontend run build` to verify frontend compilation when UI
    components or styles are touched.
-6. **Documentation Alignment**: Keep `AGENTS.md`, `CLAUDE.md`, and `Analysis.md` synchronized when
-   introducing new API endpoints, provider integrations, database tables, or clinical metrics.
+6. **Documentation Alignment**: Keep `AGENTS.md`, `CLAUDE.md`, `README.md`, `CONTRIBUTING.md`, and
+   `Analysis.md` synchronized when introducing new API endpoints, provider integrations, database
+   tables, or clinical metrics.
+7. **Pull Request Gate**: Push the feature branch and open a Pull Request (PR) targeting `main` for
+   all feature updates, bug fixes, and refactors; do not bypass the PR workflow with direct local
+   merges into `main`.
 
 ## Governance
 
@@ -141,4 +161,4 @@ defined herein.
   Constitution Check gates against these seven Core Principles before Phase 0 research and after
   Phase 1 design. Runtime development guidance is maintained in `AGENTS.md` and `CLAUDE.md`.
 
-**Version**: 1.2.0 | **Ratified**: 2026-10-22 | **Last Amended**: 2026-10-22
+**Version**: 1.3.0 | **Ratified**: 2026-10-22 | **Last Amended**: 2026-10-22
