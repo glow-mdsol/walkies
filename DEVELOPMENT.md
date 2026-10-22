@@ -21,11 +21,17 @@ walkies/
 │   ├── pyproject.toml         # Python project configuration and dependencies (uv)
 │   ├── uv.lock                # uv lockfile
 │   ├── Dockerfile             # Container definition for backend
+│   ├── telemetry/             # Multi-provider activity & CGM/insulin normalizers & clients
+│   │   ├── common.py          # Canonical mmol/L <-> mg/dL conversion & UTC timestamp helpers
+│   │   ├── garmin_epochs.py   # Garmin 15-min intraday epoch & daily summary fetcher/normalizer
+│   │   ├── carelink_normalizer.py # Medtronic CareLink 24h API & CSV normalizer
+│   │   ├── dexcom_client.py   # Dexcom Share cloud client (US/OUS) & Clarity CSV parser
+│   │   └── tandem_parser.py   # Tandem t:connect CSV parser & multi-provider CSV auto-detector
 │   ├── analytics/             # Modular analytics engine & persistence
 │   │   ├── db.py              # SQLite/PostgreSQL database engine, migrations, system logs, settings
 │   │   ├── migrate.py         # UUID migration & DB schema upgrades
 │   │   ├── service.py         # Cache management & analytics recomputation orchestration
-│   │   └── models/            # Analytics computation models (stress, risk, decouple, etc.)
+│   │   └── models/            # Analytics computation models (daily_correlation, stress, risk, etc.)
 │   ├── sources_review/        # Academic literature review and research digest tools
 │   ├── data/                  # Local data storage (gitignored)
 │   │   └── {user_sub}/        # User-isolated data partition
@@ -39,7 +45,8 @@ walkies/
 │   └── src/
 │       ├── main.jsx           # React root renderer
 │       ├── App.jsx            # Main dashboard, tab navigation, auth state management
-│       └── components/        # UI components (AnalysisView, DynamicWalkMap, GarminSyncModal, CarelinkSyncModal, etc.)
+│       ├── utils/             # glucoseUnits.js (mmol/L <-> mg/dL conversion & formatting)
+│       └── components/        # UI components (WalkAnalysisView, DailyAggregateView, GarminSyncModal, CarelinkSyncModal, DexcomSyncModal, UserSettings, etc.)
 ├── .env.example               # Environment variable template
 ├── Taskfile.yml               # Unified development task runner commands
 └── docker-compose.yml         # Local multi-container development stack
@@ -241,11 +248,18 @@ task build
 | `POST` | `/api/walks/{walk_id}/rate` | Rate a walk 1–5 stars | Yes |
 | `POST` | `/api/walks/{walk_id}/share-links` | Generate a public share token for a walk | Yes |
 | `GET` | `/api/walks/{walk_id}/share-links` | List active public share links for a walk | Yes |
+| `GET` | `/api/daily/{date}/analysis` | 24-hour epochal step/activity & CGM/insulin correlation (cached with ETag) | Yes |
+| `GET` | `/api/daily/range` | Multi-day aggregate summary (`start_date`, `end_date` up to 90 days) | Yes |
+| `POST` | `/api/daily/share-links` | Generate a public share token for a single day (`daily`) or date range (`range`) | Yes |
+| `GET` | `/api/daily/share-links` | List active public share links for daily/range summaries | Yes |
 | `DELETE` | `/api/share-links/{token}` | Revoke a public share token | Yes |
-| `GET` | `/api/shared/{token}/analysis` | Public read-only analysis endpoint | No |
-| `GET` / `POST` | `/api/settings` | Get or update user diabetic profile & treatment parameters | Yes |
+| `GET` | `/api/shared/{token}/analysis` | Public read-only analysis endpoint for walk, daily, or range share links | No |
+| `GET` / `POST` | `/api/user/settings` | Get or update user diabetic regimen, glucose unit (`mmol/L`/`mg/dL`), and thresholds | Yes |
 | `POST` | `/api/garmin/login` | Authenticate Garmin Connect account (with MFA support) | Yes |
-| `POST` | `/api/garmin/sync` | Sync and import walking FIT files from Garmin Connect | Yes |
+| `POST` | `/api/garmin/sync` | Sync walking FIT files and 15-min intraday epochs from Garmin Connect (7-day default or up to 30-day range) | Yes |
 | `POST` | `/api/carelink/upload-token` | Upload CareLink authentication token file | Yes |
-| `POST` | `/api/carelink/sync` | Sync CGM and pump events from CareLink Cloud | Yes |
+| `POST` | `/api/carelink/sync` | Sync 24h CGM and pump events from CareLink Cloud into `glycemic_events` and walks | Yes |
+| `POST` | `/api/dexcom/login` | Authenticate Dexcom Share (`us` or `ous` region) | Yes |
+| `POST` | `/api/dexcom/sync` | Sync CGM readings from Dexcom Share (7-day default or up to 30-day range) | Yes |
+| `POST` | `/api/telemetry/import` | Upload & auto-detect Medtronic CareLink, Dexcom Clarity, or Tandem t:connect CSV | Yes |
 | `GET` / `DELETE` | `/api/system/logs` | Query or clear diagnostic and application event logs | Yes |
