@@ -1,10 +1,18 @@
 import { useState, useEffect } from 'react'
 import SystemLogsSection from './SystemLogsSection'
+import DexcomSyncModal from './DexcomSyncModal'
+import { mmolToDisplay, displayToMmol } from '../utils/glucoseUnits'
 
 export const DEFAULT_USER_SETTINGS = {
   user_type: 'non_diabetic',
   insulin_type: 'None',
+  glucose_unit: 'mmol/L',
+  target_low_mmol: 4.0,
+  target_high_mmol: 8.0,
+  hypo_threshold_mmol: 3.9,
+  hyper_threshold_mmol: 12.9,
   pump_brand_model: '',
+  cgm_provider: 'none',
   basal_rates: { default: 0.8, exercise: 0.5 },
   carb_ratios: { default: 5 },
   insulin_sensitivity_factor: 2.0,
@@ -21,7 +29,9 @@ export const DEFAULT_USER_SETTINGS = {
     durationMaxHours: 5.0,
   },
   garmin_email: null,
-  carelink_email: null
+  carelink_email: null,
+  dexcom_username: null,
+  dexcom_region: 'ous',
 }
 
 export const INSULIN_TEMPLATES = [
@@ -146,7 +156,8 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
     if (userSettings && userSettings.updated_at) {
       let userType = userSettings.user_type
       if (!userType) {
-        if (userSettings.insulin_type === 'Pump') userType = 'diabetic_pump'
+        if (userSettings.insulin_type === 'ClosedLoopPump') userType = 'diabetic_closed_loop'
+        else if (userSettings.insulin_type === 'Pump') userType = 'diabetic_pump'
         else if (userSettings.insulin_type === 'MDI') userType = 'diabetic_mdi'
         else userType = 'non_diabetic'
       }
@@ -154,7 +165,13 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
       return {
         user_type: userType,
         insulin_type: userSettings.insulin_type || 'None',
+        glucose_unit: userSettings.glucose_unit || 'mmol/L',
+        target_low_mmol: userSettings.target_low_mmol ?? 4.0,
+        target_high_mmol: userSettings.target_high_mmol ?? 8.0,
+        hypo_threshold_mmol: userSettings.hypo_threshold_mmol ?? 3.9,
+        hyper_threshold_mmol: userSettings.hyper_threshold_mmol ?? 12.9,
         pump_brand_model: userSettings.pump_brand_model || '',
+        cgm_provider: userSettings.cgm_provider || 'none',
         basal_rates: userSettings.basal_rates || { ...DEFAULT_USER_SETTINGS.basal_rates },
         carb_ratios: userSettings.carb_ratios || { ...DEFAULT_USER_SETTINGS.carb_ratios },
         insulin_sensitivity_factor: userSettings.insulin_sensitivity_factor ?? DEFAULT_USER_SETTINGS.insulin_sensitivity_factor,
@@ -162,7 +179,10 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
         exercise_correction_factor: userSettings.exercise_correction_factor ?? DEFAULT_USER_SETTINGS.exercise_correction_factor,
         iob_calculation_method: userSettings.iob_calculation_method || DEFAULT_USER_SETTINGS.iob_calculation_method,
         insulin_profile: userSettings.insulin_profile || { ...DEFAULT_USER_SETTINGS.insulin_profile },
-        garmin_email: userSettings.garmin_email || null
+        garmin_email: userSettings.garmin_email || null,
+        carelink_email: userSettings.carelink_email || null,
+        dexcom_username: userSettings.dexcom_username || null,
+        dexcom_region: userSettings.dexcom_region || 'ous',
       }
     }
     return { ...DEFAULT_USER_SETTINGS }
@@ -433,6 +453,14 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
           CareLink Sync
         </button>
         <button
+          className={`home-tab${activeTab === 'dexcom' ? ' home-tab--active' : ''}`}
+          onClick={() => setActiveTab('dexcom')}
+          type="button"
+          style={{ borderBottom: 'none' }}
+        >
+          Dexcom Sync
+        </button>
+        <button
           className={`home-tab${activeTab === 'logs' ? ' home-tab--active' : ''}`}
           onClick={() => setActiveTab('logs')}
           type="button"
@@ -445,33 +473,97 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
       <div className="card insulin-setup-card">
         {activeTab === 'clinical' && (
           <>
-            {/* User Type / Diabetic Status */}
-            {/* ... rest of clinical fields ... */}
-            {/* (Unmodified code target for clinical settings form inputs) */}
-        <FieldRow label="User Profile Type" hint="Select your biometric and therapy profile">
+        <FieldRow label="User Profile & Therapy Regimen" hint="Select your diabetic or metabolic regimen">
           <select
             className="setup-text-input"
             value={form.user_type}
             onChange={(e) => {
               const ut = e.target.value
               let it = 'None'
-              if (ut === 'diabetic_pump') it = 'Pump'
+              if (ut === 'diabetic_closed_loop') it = 'ClosedLoopPump'
+              else if (ut === 'diabetic_pump') it = 'Pump'
               else if (ut === 'diabetic_mdi') it = 'MDI'
               setSaved(false)
               setForm(prev => ({ ...prev, user_type: ut, insulin_type: it }))
             }}
-            style={{ maxWidth: '320px', padding: '0.45rem' }}
+            style={{ maxWidth: '380px', padding: '0.45rem' }}
           >
-            <option value="diabetic_pump">Diabetic with CGM (Pump Therapy)</option>
-            <option value="diabetic_mdi">Diabetic with CGM (Basal/Bolus)</option>
-            <option value="non_diabetic_cgm">Non-diabetic with CGM</option>
-            <option value="non_diabetic">Non-diabetic without CGM</option>
+            <option value="diabetic_closed_loop">Diabetic — Automated Closed-Loop Pump (780G / Control-IQ / Omnipod 5)</option>
+            <option value="diabetic_pump">Diabetic — Standard Insulin Pump</option>
+            <option value="diabetic_mdi">Diabetic — Multiple Daily Injections (MDI / Basal-Bolus)</option>
+            <option value="diabetic_lifestyle">Diabetic — Non-Insulin / Oral Meds / Lifestyle</option>
+            <option value="non_diabetic_cgm">Non-Diabetic with CGM</option>
+            <option value="non_diabetic">Non-Diabetic without CGM</option>
           </select>
         </FieldRow>
 
+        <FieldRow label="Preferred Glucose Display Unit" hint="All charts, stats, slopes, and thresholds adapt to this unit">
+          <select
+            className="setup-text-input"
+            value={form.glucose_unit || 'mmol/L'}
+            onChange={(e) => updateRoot('glucose_unit', e.target.value)}
+            style={{ maxWidth: '220px', padding: '0.45rem' }}
+          >
+            <option value="mmol/L">mmol/L (International Standard)</option>
+            <option value="mg/dL">mg/dL (US / Mass Standard)</option>
+          </select>
+        </FieldRow>
+
+        {form.user_type !== 'non_diabetic' && (
+          <>
+            <FieldRow label={`Target Glucose Range (${form.glucose_unit})`} hint="Clinical range used for Time in Range (TIR) calculations">
+              <div className="setup-range-row">
+                <span className="setup-range-label">Low</span>
+                <input
+                  type="number"
+                  className="setup-text-input"
+                  style={{ width: '90px' }}
+                  step={form.glucose_unit === 'mg/dL' ? '1' : '0.1'}
+                  value={mmolToDisplay(form.target_low_mmol, form.glucose_unit)}
+                  onChange={(e) => updateRoot('target_low_mmol', displayToMmol(e.target.value, form.glucose_unit))}
+                />
+                <span className="setup-range-label">High</span>
+                <input
+                  type="number"
+                  className="setup-text-input"
+                  style={{ width: '90px' }}
+                  step={form.glucose_unit === 'mg/dL' ? '1' : '0.1'}
+                  value={mmolToDisplay(form.target_high_mmol, form.glucose_unit)}
+                  onChange={(e) => updateRoot('target_high_mmol', displayToMmol(e.target.value, form.glucose_unit))}
+                />
+                <span className="setup-value">{form.glucose_unit}</span>
+              </div>
+            </FieldRow>
+
+            <FieldRow label={`Hypo & Hyper Thresholds (${form.glucose_unit})`} hint="Thresholds for sustained hypoglycemia (≥15m) and hyperglycemia">
+              <div className="setup-range-row">
+                <span className="setup-range-label">Hypo ≤</span>
+                <input
+                  type="number"
+                  className="setup-text-input"
+                  style={{ width: '90px' }}
+                  step={form.glucose_unit === 'mg/dL' ? '1' : '0.1'}
+                  value={mmolToDisplay(form.hypo_threshold_mmol, form.glucose_unit)}
+                  onChange={(e) => updateRoot('hypo_threshold_mmol', displayToMmol(e.target.value, form.glucose_unit))}
+                />
+                <span className="setup-range-label">Hyper ≥</span>
+                <input
+                  type="number"
+                  className="setup-text-input"
+                  style={{ width: '90px' }}
+                  step={form.glucose_unit === 'mg/dL' ? '1' : '0.1'}
+                  value={mmolToDisplay(form.hyper_threshold_mmol, form.glucose_unit)}
+                  onChange={(e) => updateRoot('hyper_threshold_mmol', displayToMmol(e.target.value, form.glucose_unit))}
+                />
+                <span className="setup-value">{form.glucose_unit}</span>
+              </div>
+            </FieldRow>
+          </>
+        )}
+
         {form.insulin_type === 'None' && (
           <div className="setup-preview" style={{ background: '#f0fdf4', borderColor: '#bbf7d0', color: '#166534' }}>
-            <span className="setup-preview-label">Non-Diabetic Configuration:</span>
+            <span className="setup-preview-label">Non-Insulin Configuration:</span>
             <span>No insulin or pump-specific parameters are required. Click "Save Profile" to continue.</span>
           </div>
         )}
@@ -479,7 +571,7 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
         {form.insulin_type !== 'None' && (
           <>
             {/* Pump Brand & Model (Pump-only) */}
-            {form.insulin_type === 'Pump' && (
+            {(form.insulin_type === 'Pump' || form.insulin_type === 'ClosedLoopPump') && (
               <>
                 <FieldRow label="Pump Brand & Model" hint="e.g. Medtronic 780G, Tandem t:slim X2">
                   <input
@@ -545,12 +637,12 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
                   type="number"
                   className="setup-text-input"
                   style={{ width: '100px' }}
-                  step="0.1"
+                  step={form.glucose_unit === 'mg/dL' ? '1' : '0.1'}
                   min="0.1"
-                  value={form.insulin_sensitivity_factor}
-                  onChange={(e) => updateRoot('insulin_sensitivity_factor', e.target.value)}
+                  value={mmolToDisplay(form.insulin_sensitivity_factor, form.glucose_unit)}
+                  onChange={(e) => updateRoot('insulin_sensitivity_factor', displayToMmol(e.target.value, form.glucose_unit))}
                 />
-                <span className="setup-value">mmol/L per U</span>
+                <span className="setup-value">{form.glucose_unit} per U</span>
               </div>
             </FieldRow>
 
@@ -560,12 +652,12 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
                   type="number"
                   className="setup-text-input"
                   style={{ width: '100px' }}
-                  step="0.1"
+                  step={form.glucose_unit === 'mg/dL' ? '1' : '0.1'}
                   min="3.0"
-                  value={form.correction_threshold}
-                  onChange={(e) => updateRoot('correction_threshold', e.target.value)}
+                  value={mmolToDisplay(form.correction_threshold, form.glucose_unit)}
+                  onChange={(e) => updateRoot('correction_threshold', displayToMmol(e.target.value, form.glucose_unit))}
                 />
-                <span className="setup-value">mmol/L</span>
+                <span className="setup-value">{form.glucose_unit}</span>
               </div>
             </FieldRow>
 
@@ -912,6 +1004,24 @@ export default function UserSettings({ userSettings, onSave, isRegistration, onB
                 </section>
               </div>
             )}
+          </div>
+        )}
+
+        {activeTab === 'dexcom' && (
+          <div style={{ padding: '0.5rem 0' }}>
+            <p className="hint" style={{ marginBottom: '1rem' }}>
+              Connect your Dexcom Share account (US or International / Outside US) for direct cloud CGM synchronization across both daily 24-hour views and GPS walks.
+            </p>
+            <DexcomSyncModal
+              apiFetch={apiFetch}
+              currentUsername={form.dexcom_username || ''}
+              currentRegion={form.dexcom_region || 'ous'}
+              onConnected={(payload) => {
+                updateRoot('dexcom_username', payload.username)
+                updateRoot('dexcom_region', payload.region)
+                updateRoot('cgm_provider', 'dexcom')
+              }}
+            />
           </div>
         )}
 

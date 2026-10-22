@@ -6,16 +6,17 @@ This document provides system guidelines, architecture overview, testing convent
 
 ## 1. Project Overview & Clinical Context
 
-**Walkies** is an open-source web application designed for Type 1 diabetics (specifically tuned for MiniMed 780G pump + Guardian 4 CGM users and Garmin GPS sport watches) who hike/walk. The platform correlates activity performance metrics (heart rate, pace, elevation profile, distance) with physiological and glycemic signals (continuous blood glucose, basal deliveries, bolus timing, SmartGuard automation, and insulin-on-board).
+**Walkies** is an open-source web application designed for individuals with diabetes across all regimens (Closed-Loop AID Pump such as MiniMed 780G / Tandem Control-IQ, Standard Insulin Pump, Multiple Daily Injections / MDI, and Non-Insulin / Lifestyle therapy, as well as Non-Diabetic CGM users) and Garmin GPS sport watch users who hike/walk. The platform correlates both recorded walk workouts and 24-hour / multi-day Garmin intraday step and activity epochs (`15-minute` buckets) with physiological and glycemic signals (continuous blood glucose from Medtronic CareLink, Dexcom Share/Clarity, and Tandem t:connect, basal deliveries, bolus timing, closed-loop automation, and insulin-on-board).
 
 ### Clinical & Metabolic Parameters
-- **Target Range**: 4.0 – 8.0 mmol/L (72 – 144 mg/dL)
-- **Hypoglycemia Threshold**: ≤ 3.9 mmol/L (70 mg/dL)
-- **Hyperglycemia Threshold**: ≥ 12.9 mmol/L (232 mg/dL)
+- **Glucose Display Units**: Configurable per user (`mmol/L` default or `mg/dL`, `1 mmol/L = 18.0182 mg/dL`); canonical backend storage and analytics use `mmol/L`.
+- **Target Range (default)**: 4.0 – 8.0 mmol/L (72 – 144 mg/dL), customizable per user
+- **Hypoglycemia Threshold (default)**: ≤ 3.9 mmol/L (70 mg/dL), customizable per user (ATTD consensus: ≥15 consecutive minutes for sustained episode counting)
+- **Hyperglycemia Threshold (default)**: ≥ 12.9 mmol/L (232 mg/dL), customizable per user
 - **Standard Carb Ratio (default)**: 5 g/U
-- **Insulin Sensitivity (ISF default)**: 2.0 mmol/L per U
+- **Insulin Sensitivity (ISF default)**: 2.0 mmol/L per U (36 mg/dL per U)
 - **Insulin Decay (DIA)**: ~4 hours (peak action ~75 min for rapid-acting analogs)
-- **SmartGuard**: Detects pump suspend/resume states (`PLGM_PREDICTED_LOW_SG`, `NORMAL_PUMPING`, manual suspend) and calculates exercise hypo risk.
+- **Closed-Loop / SmartGuard**: Detects pump suspend/resume states (`PLGM_PREDICTED_LOW_SG`, `NORMAL_PUMPING`, Control-IQ exercise/suspend, manual suspend) and calculates exercise hypo risk.
 
 ---
 
@@ -29,12 +30,19 @@ walkies/
 │   ├── uv.lock                      # uv lockfile
 │   ├── Dockerfile                   # Container definition for backend deployment
 │   ├── carelink_client2.py          # Standalone client for Medtronic Carelink data
+│   ├── telemetry/                   # Multi-provider activity & CGM/insulin normalizers and clients
+│   │   ├── __init__.py              # Public exports for telemetry ingestion & unit conversion
+│   │   ├── common.py                # Canonical mmol/L <-> mg/dL conversion & UTC timestamp helpers
+│   │   ├── garmin_epochs.py         # Garmin 15-min intraday epoch & daily wellness fetcher/normalizer
+│   │   ├── carelink_normalizer.py   # Medtronic CareLink 24h API & CSV normalizer
+│   │   ├── dexcom_client.py         # Dexcom Share cloud client (US/OUS) & Dexcom Clarity CSV parser
+│   │   └── tandem_parser.py         # Tandem t:connect CSV parser & multi-provider CSV auto-detector
 │   ├── analytics/                   # Modular analytics engine & persistence
 │   │   ├── __init__.py              # Public exports for analytics helpers
 │   │   ├── db.py                    # SQLite/PostgreSQL database engine, migrations, system logs, settings
 │   │   ├── migrate.py               # UUID migration & DB schema upgrades
 │   │   ├── service.py               # Cache management & analytics recomputation orchestration
-│   │   └── models/                  # Analytics computation modules (stress, risk, decouple, etc.)
+│   │   └── models/                  # Analytics computation modules (daily_correlation, stress, risk, etc.)
 │   ├── sources_review/              # Research & PubMed literature digest tools
 │   │   ├── literature.py            # Academic literature parsing and DOI resolver
 │   │   └── sources_review.py        # Scientific literature reviewer CLI & digest builder
@@ -46,9 +54,12 @@ walkies/
 │       ├── conftest.py              # Pytest fixtures and mock setup
 │       ├── test_account_deletion.py
 │       ├── test_carelink_sync.py
+│       ├── test_daily_correlation.py
 │       ├── test_exercise_risk.py
 │       ├── test_garmin_sync.py
+│       ├── test_glucose_units_settings.py
 │       ├── test_logging.py
+│       ├── test_multi_provider_ingest.py
 │       ├── test_rate_walk.py
 │       ├── test_rename_walk.py
 │       ├── test_settings.py
@@ -61,14 +72,17 @@ walkies/
 │   ├── src/
 │   │   ├── main.jsx                 # React root renderer
 │   │   ├── App.jsx                  # Main dashboard, tab navigation, auth state management
+│   │   ├── utils/
+│   │   │   └── glucoseUnits.js      # Frontend mmol/L <-> mg/dL conversion & formatting utilities
 │   │   ├── components/              # Modular UI components
-│   │   │   ├── AnalysisView.jsx     # Comprehensive walk analysis & multi-panel charts
-│   │   │   ├── DynamicWalkMap.jsx   # Interactive Leaflet map (BG & HR polyline shading)
-│   │   │   ├── GarminSyncModal.jsx  # Garmin Connect direct sync with MFA support
+│   │   │   ├── WalkAnalysisView.jsx # Comprehensive walk analysis & multi-panel charts
+│   │   │   ├── DailyAggregateView.jsx # 24h & multi-day epochal step/activity & CGM correlation dashboard
+│   │   │   ├── GarminSyncModal.jsx  # Garmin Connect direct sync with MFA & 7–30 day lookback support
 │   │   │   ├── CarelinkSyncModal.jsx# Carelink sync token management
-│   │   │   ├── SettingsView.jsx     # Diabetes profile & user settings manager
+│   │   │   ├── DexcomSyncModal.jsx  # Dexcom Share cloud sync & multi-provider CSV import modal
+│   │   │   ├── UserSettings.jsx     # Diabetes regimen, glucose unit, sync & user settings manager
 │   │   │   ├── SystemLogsSection.jsx# Real-time event and error logs viewer
-│   │   │   ├── UploadForm.jsx       # Multi-file upload interface
+│   │   │   ├── UploadForm.jsx       # Multi-file walk & standalone telemetry CSV upload interface
 │   │   │   └── WalkList.jsx         # Walk library, search, filtering, and summary cards
 │   │   └── styles/                  # Clean modern CSS stylesheets
 ├── .github/
@@ -137,14 +151,14 @@ If `task` is installed:
 - Walk directories are identified by canonical UUIDs (`meta.json` contains `"id": "<uuid>"`, `"name"`, `"date"`, `"legacy_id"`, and file metadata).
 
 ### 2. Analytics Engine & Caching
-- Analytics calculations (distance, duration, HR decoupling, BG drop rate, Time In Range, SmartGuard events, IOB proxies) are computed deterministically.
-- Computed analytics are cached in an SQLite database (or Postgres in cloud environments via `ANALYTICS_DB_URL`).
-- Versioning is enforced with `ANALYTICS_VERSION`. When the version increments or files change (validated by source file hashing), analytics are automatically recomputed.
+- Analytics calculations (walk distance, duration, HR decoupling, BG drop rate, Time In Range, SmartGuard events, IOB proxies, and 24-hour / multi-day epochal step-glycemic correlation) are computed deterministically.
+- Computed analytics are cached in `walk_analytics` and `daily_analytics` tables in an SQLite database (or Postgres in cloud environments via `ANALYTICS_DB_URL`).
+- Versioning is enforced with `ANALYTICS_VERSION`. When the version increments, user glycemic thresholds change, or source files/telemetry rows change (validated by source hashing), analytics are automatically recomputed.
 - Read operations send HTTP `ETag` and `Cache-Control` headers.
 
 ### 3. Sharing Links (Public Access)
-- Authenticated users can generate shareable public links for individual walks (`share_links` table).
-- Public share tokens allow unauthenticated users to view read-only analysis without leaking user directories or other walks.
+- Authenticated users can generate shareable public links for individual walks (`share_type='walk'`), single-day summaries (`share_type='daily'`), and multi-day aggregate ranges (`share_type='range'`) via the `share_links` table.
+- Public share tokens allow unauthenticated users to view read-only analysis without leaking user directories or other dates/walks.
 - Tokens can be revoked by the owner at any time.
 
 ### 4. Logging & Diagnostics

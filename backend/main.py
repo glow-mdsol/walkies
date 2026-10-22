@@ -48,6 +48,32 @@ from analytics import (
     migrate_walk_ids_to_uuids,
     WalkiesDBLogHandler,
     log_system_event,
+    list_share_links_for_target,
+    get_or_compute_daily_analytics,
+    get_or_compute_daily_range_analytics,
+    upsert_activity_epochs,
+    get_activity_epochs_for_date,
+    upsert_daily_wellness_summary,
+    get_daily_wellness_summary,
+    upsert_glycemic_events,
+    get_glycemic_events_for_date,
+    get_glycemic_events_for_window,
+)
+from telemetry.garmin_epochs import (
+    fetch_garmin_epochs_for_dates,
+    resolve_sync_date_range,
+)
+from telemetry.carelink_normalizer import (
+    normalize_carelink_api_payload,
+    parse_carelink_csv,
+)
+from telemetry.dexcom_client import (
+    DexcomShareClient,
+    parse_dexcom_clarity_csv,
+)
+from telemetry.tandem_parser import (
+    detect_and_parse_telemetry_csv,
+    parse_tandem_csv,
 )
 
 import logging
@@ -2937,6 +2963,195 @@ def list_walk_share_links(walk_id: str, user: dict = Depends(_require_user)):
     }
 
 
+def _get_user_walk_windows_and_summaries(user_sub: str, data_root: Path) -> tuple[list[dict], dict[str, list[dict]]]:
+    """Build walk time windows (for 15-min epoch deduplication) and per-date linked walk summaries."""
+    walk_windows: list[dict] = []
+    linked_by_date: dict[str, list[dict]] = {}
+    if not data_root.exists() or not data_root.is_dir():
+        return walk_windows, linked_by_date
+
+    for walk_dir in _iter_walk_dirs(data_root):
+        meta = _load_walk_meta(walk_dir)
+        walk_id = meta.get("id") or walk_dir.name
+        walk_date = meta.get("date") or walk_dir.parent.name
+        walk_name = meta.get("name") or "Walk"
+        start_iso = meta.get("start_time")
+
+        fit_files = list(walk_dir.glob("*.fit"))
+        start_dt = None
+        end_dt = None
+        if fit_files:
+            try:
+                start_dt, end_dt = _fit_time_bounds(fit_files[0].read_bytes())
+            except Exception:
+                start_dt, end_dt = None, None
+
+        if start_dt is None and start_iso:
+            try:
+                start_dt = datetime.fromisoformat(str(start_iso).replace("Z", "+00:00"))
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                start_dt = None
+
+        cached = get_cached_analytics_row(walk_id)
+        metrics = (cached or {}).get("metrics") or {}
+        if end_dt is None and start_dt is not None:
+            dur_h = metrics.get("duration_h")
+            dur_s = float(dur_h) * 3600.0 if dur_h else 3600.0
+            end_dt = start_dt + timedelta(seconds=dur_s)
+
+        if start_dt and end_dt:
+            walk_windows.append({
+                "walk_id": walk_id,
+                "date": walk_date,
+                "start_utc": start_dt,
+                "end_utc": end_dt,
+            })
+
+        linked_by_date.setdefault(walk_date, []).append({
+            "id": walk_id,
+            "name": walk_name,
+            "start_time": start_dt.isoformat() if start_dt else start_iso,
+            "distance_km": metrics.get("distance_km"),
+            "tir_pct": metrics.get("tir_pct"),
+        })
+
+    return walk_windows, linked_by_date
+
+
+def _sanitize_shared_settings(settings: dict | None) -> dict:
+    """Strip private emails/usernames from settings before returning on public share links."""
+    if not settings:
+        return {}
+    sanitized = dict(settings)
+    for k in ("user_sub", "garmin_email", "carelink_email", "dexcom_username"):
+        sanitized.pop(k, None)
+    return sanitized
+
+
+@app.get('/api/daily/range')
+def daily_range_analysis(
+    request: Request,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    days: int = 7,
+    force: bool = False,
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    try:
+        date_list = resolve_sync_date_range(
+            start_date=start_date,
+            end_date=end_date,
+            default_days=min(max(1, days), 90),
+            max_days=90,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    data_root = _user_data_dir(user_sub)
+    _, linked_by_date = _get_user_walk_windows_and_summaries(user_sub, data_root)
+    result = get_or_compute_daily_range_analytics(
+        user_sub=user_sub,
+        start_date=date_list[0],
+        end_date=date_list[-1],
+        force=force,
+        linked_walks_by_date=linked_by_date,
+    )
+    return _json_with_cache(result, request, public=False)
+
+
+@app.get('/api/daily/share-links')
+def list_daily_share_links_endpoint(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    share_type: str | None = None,
+    user: dict = Depends(_require_user),
+):
+    rows = list_share_links_for_target(
+        owner_sub=user['sub'],
+        start_date=start_date,
+        end_date=end_date,
+        share_type=share_type,
+    )
+    return {"links": rows}
+
+
+@app.post('/api/daily/share-links')
+def create_daily_share_link_endpoint(
+    payload: dict = Body(...),
+    user: dict = Depends(_require_user),
+):
+    share_type = payload.get("share_type", "daily")
+    if share_type not in ("daily", "range"):
+        raise HTTPException(status_code=400, detail="share_type must be 'daily' or 'range'")
+
+    start_date = (payload.get("start_date") or payload.get("date") or "").strip()[:10]
+    end_date = (payload.get("end_date") or start_date).strip()[:10]
+    if not start_date:
+        raise HTTPException(status_code=400, detail="start_date is required")
+
+    try:
+        s_dt = date_type.fromisoformat(start_date)
+        e_dt = date_type.fromisoformat(end_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Dates must be in YYYY-MM-DD format")
+    if e_dt < s_dt:
+        raise HTTPException(status_code=400, detail="end_date must be >= start_date")
+
+    expires_in_days = payload.get("expires_in_days")
+    now_dt = datetime.now(timezone.utc)
+    created_at = now_dt.isoformat()
+    expires_at = None
+    if expires_in_days is not None:
+        try:
+            expires_at = (now_dt + timedelta(days=int(expires_in_days))).isoformat()
+        except (TypeError, ValueError):
+            expires_at = None
+
+    token = secrets.token_urlsafe(18)
+    synthetic_target_id = f"{share_type}:{start_date}:{end_date}"
+    create_share_link(
+        token=token,
+        owner_sub=user['sub'],
+        walk_id=synthetic_target_id,
+        created_at=created_at,
+        expires_at=expires_at,
+        share_type=share_type,
+        target_start_date=start_date,
+        target_end_date=end_date,
+    )
+    return {
+        "token": token,
+        "share_type": share_type,
+        "start_date": start_date,
+        "end_date": end_date,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "share_path": f"/api/shared/{token}/analysis",
+    }
+
+
+@app.get('/api/daily/{date}/analysis')
+def daily_analysis_endpoint(
+    date: str,
+    request: Request,
+    force: bool = False,
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    data_root = _user_data_dir(user_sub)
+    _, linked_by_date = _get_user_walk_windows_and_summaries(user_sub, data_root)
+    result = get_or_compute_daily_analytics(
+        user_sub=user_sub,
+        local_date=date,
+        force=force,
+        linked_walks=linked_by_date.get(date, []),
+    )
+    return _json_with_cache(result, request, public=False)
+
+
 @app.delete('/api/share-links/{token}')
 def revoke_walk_share_link(token: str, user: dict = Depends(_require_user)):
     revoked = revoke_share_link(token, user['sub'], datetime.now(timezone.utc).isoformat())
@@ -2946,6 +3161,7 @@ def revoke_walk_share_link(token: str, user: dict = Depends(_require_user)):
 
 
 @app.get('/api/share/{token}/analysis-data')
+@app.get('/api/shared/{token}/analysis')
 def shared_walk_analysis_data(token: str, request: Request):
     share = get_share_link(token)
     if share is None:
@@ -2965,14 +3181,51 @@ def shared_walk_analysis_data(token: str, request: Request):
             raise HTTPException(status_code=500, detail='Invalid share link expiry')
 
     owner_sub = share['owner_sub']
-    walk_id = share['walk_id']
+    share_type = share.get('share_type') or 'walk'
     data_root = _user_data_dir(owner_sub)
+    settings = _sanitize_shared_settings(get_user_settings(owner_sub))
+
+    if share_type == 'daily':
+        target_date = share.get('target_start_date') or share['walk_id'].split(':')[-1]
+        _, linked_by_date = _get_user_walk_windows_and_summaries(owner_sub, data_root)
+        daily_payload = get_or_compute_daily_analytics(
+            user_sub=owner_sub,
+            local_date=target_date,
+            linked_walks=linked_by_date.get(target_date, []),
+        )
+        result = {
+            **daily_payload,
+            'share_type': 'daily',
+            'user_settings': settings,
+            'shared': True,
+        }
+        return _json_with_cache(result, request, public=True)
+
+    if share_type == 'range':
+        start_d = share.get('target_start_date')
+        end_d = share.get('target_end_date') or start_d
+        _, linked_by_date = _get_user_walk_windows_and_summaries(owner_sub, data_root)
+        range_payload = get_or_compute_daily_range_analytics(
+            user_sub=owner_sub,
+            start_date=start_d,
+            end_date=end_d,
+            linked_walks_by_date=linked_by_date,
+        )
+        result = {
+            **range_payload,
+            'share_type': 'range',
+            'user_settings': settings,
+            'shared': True,
+        }
+        return _json_with_cache(result, request, public=True)
+
+    walk_id = share['walk_id']
     date, walk_name, payload, metrics = _get_walk_analysis_data(walk_id, persist_analytics=True, data_root=data_root)
     walk_dir = _find_walk_dir(walk_id, data_root)
     files = sorted(f.name for f in walk_dir.iterdir() if f.is_file() and f.name != 'meta.json') if walk_dir else []
     meta = _load_walk_meta(walk_dir) if walk_dir else {}
-    settings = get_user_settings(owner_sub)
     result = {
+        'share_type': 'walk',
         'walk_id': walk_id,
         'date': date,
         'name': walk_name,
@@ -3059,6 +3312,7 @@ def route_compare(group_id: str, user: dict = Depends(_require_user)):
 
 
 @app.get('/api/user/settings')
+@app.get('/api/settings')
 def get_settings(user: dict = Depends(_require_user)):
     settings = get_user_settings(user['sub'])
     if settings is None:
@@ -3080,8 +3334,12 @@ def get_settings(user: dict = Depends(_require_user)):
 
 
 @app.post('/api/user/settings')
+@app.post('/api/settings')
 def update_settings(settings: dict, user: dict = Depends(_require_user)):
-    upsert_user_settings(user['sub'], settings)
+    try:
+        upsert_user_settings(user['sub'], settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "ok"}
 
 
@@ -3527,10 +3785,30 @@ async def import_selected_garmin_activity(
 
 @app.post("/api/garmin/sync")
 def sync_garmin_walks(
+    payload: dict | None = Body(default=None),
     user: dict = Depends(_require_user),
 ):
     user_sub = user['sub']
-    logger.info(f"Starting Garmin activity sync for user sub: {user_sub}")
+    req = payload or {}
+    start_date_req = req.get("start_date")
+    end_date_req = req.get("end_date")
+    include_epochs = bool(req.get("include_epochs", True))
+    include_walks = bool(req.get("include_walks", True))
+
+    try:
+        sync_dates = resolve_sync_date_range(
+            start_date=start_date_req,
+            end_date=end_date_req,
+            default_days=7,
+            max_days=30,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    logger.info(
+        f"Starting Garmin sync for user sub: {user_sub} "
+        f"({sync_dates[0]} to {sync_dates[-1]}, walks={include_walks}, epochs={include_epochs})"
+    )
     settings = get_user_settings(user_sub)
     if not settings or not settings.get("garmin_email"):
         logger.warning(f"Garmin sync aborted: no Garmin email connected for user sub: {user_sub}")
@@ -3549,54 +3827,93 @@ def sync_garmin_walks(
         logger.error(f"Garmin session authentication failed for user sub: {user_sub}. Error: {e}", exc_info=True)
         raise HTTPException(status_code=401, detail=f"Garmin session invalid: {e}. Please reconnect.")
 
-    try:
-        logger.info(f"Fetching recent Garmin activities list for user sub: {user_sub}")
-        activities = client.get_activities(0, 10)
-        logger.info(f"Successfully fetched {len(activities)} activities from Garmin API")
-    except Exception as e:
-        logger.error(f"Garmin API activities fetch failed for user sub: {user_sub}. Error: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Garmin API call failed: {e}")
-
     imported_walks = []
-    for act in activities:
-        act_type = act.get("activityType", {}).get("typeKey")
-        activity_id = act["activityId"]
-        start_time_str = act.get("startTimeLocal")
-
-        logger.debug(f"Evaluating Garmin activity {activity_id} ({act_type}) start time: {start_time_str}")
-        if act_type not in ("walking", "hiking"):
-            continue
-
-        if not start_time_str:
-            continue
-        act_date = start_time_str.split(" ")[0]
-
-        # Duplicate checking
-        already_imported = False
-        for walk_dir in _iter_walk_dirs(data_root):
-            meta = _load_walk_meta(walk_dir)
-            if meta.get("garmin_activity_id") == str(activity_id) or meta.get("start_time") == act.get("startTimeGMT"):
-                already_imported = True
-                break
-
-        if already_imported:
-            logger.debug(f"Garmin activity {activity_id} already imported. Skipping.")
-            continue
-
+    if include_walks and hasattr(client, "get_activities"):
         try:
-            walk_info = _import_single_garmin_activity(
-                client=client,
-                activity_id=activity_id,
-                act_data=act,
-                data_root=data_root,
-                user_sub=user_sub,
-            )
-            imported_walks.append(walk_info)
+            logger.info(f"Fetching recent Garmin activities list for user sub: {user_sub}")
+            activities = client.get_activities(0, 10)
+            logger.info(f"Successfully fetched {len(activities)} activities from Garmin API")
         except Exception as e:
-            logger.error(f"Failed to import activity {activity_id}: {e}", exc_info=True)
-            continue
+            logger.error(f"Garmin API activities fetch failed for user sub: {user_sub}. Error: {e}", exc_info=True)
+            raise HTTPException(status_code=502, detail=f"Garmin API call failed: {e}")
 
-    return {"status": "ok", "imported": imported_walks}
+        for act in activities:
+            act_type = act.get("activityType", {}).get("typeKey")
+            activity_id = act["activityId"]
+            start_time_str = act.get("startTimeLocal")
+
+            logger.debug(f"Evaluating Garmin activity {activity_id} ({act_type}) start time: {start_time_str}")
+            if act_type not in ("walking", "hiking"):
+                continue
+
+            if not start_time_str:
+                continue
+            act_date = start_time_str.split(" ")[0]
+            if (start_date_req or end_date_req) and act_date not in sync_dates:
+                continue
+
+            # Duplicate checking
+            already_imported = False
+            for walk_dir in _iter_walk_dirs(data_root):
+                meta = _load_walk_meta(walk_dir)
+                if meta.get("garmin_activity_id") == str(activity_id) or meta.get("start_time") == act.get("startTimeGMT"):
+                    already_imported = True
+                    break
+
+            if already_imported:
+                logger.debug(f"Garmin activity {activity_id} already imported. Skipping.")
+                continue
+
+            try:
+                walk_info = _import_single_garmin_activity(
+                    client=client,
+                    activity_id=activity_id,
+                    act_data=act,
+                    data_root=data_root,
+                    user_sub=user_sub,
+                )
+                imported_walks.append(walk_info)
+            except Exception as e:
+                logger.error(f"Failed to import activity {activity_id}: {e}", exc_info=True)
+                continue
+
+    epochs_upserted = 0
+    if include_epochs:
+        walk_windows, linked_by_date = _get_user_walk_windows_and_summaries(user_sub, data_root)
+        epochs_rows, summary_rows = fetch_garmin_epochs_for_dates(
+            client=client,
+            dates=sync_dates,
+            walk_windows=walk_windows,
+        )
+        if epochs_rows:
+            epochs_upserted = upsert_activity_epochs(user_sub, epochs_rows)
+        for s_row in summary_rows:
+            upsert_daily_wellness_summary(user_sub, s_row["local_date"], s_row)
+
+        touched_dates = sorted({r["local_date"] for r in epochs_rows} | {r["local_date"] for r in summary_rows})
+        for d_str in touched_dates:
+            try:
+                get_or_compute_daily_analytics(
+                    user_sub=user_sub,
+                    local_date=d_str,
+                    force=True,
+                    linked_walks=linked_by_date.get(d_str, []),
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to recompute daily analytics for {d_str}: {exc}")
+
+    settings["last_garmin_sync_at"] = datetime.now(timezone.utc).isoformat()
+    upsert_user_settings(user_sub, settings)
+
+    return {
+        "status": "ok",
+        "start_date": sync_dates[0],
+        "end_date": sync_dates[-1],
+        "days_synced": len(sync_dates),
+        "epochs_upserted": epochs_upserted,
+        "imported": imported_walks,
+        "walks_imported": imported_walks,
+    }
 
 
 
@@ -3656,11 +3973,129 @@ async def carelink_upload_token(
     return {"status": "success", "username": username}
 
 
+def _sync_glycemic_events_to_overlapping_walks(
+    user_sub: str,
+    data_root: Path,
+    events: list[dict],
+    csv_filename: str = "carelink_sync.csv",
+) -> list[dict]:
+    """Write overlapping normalized glycemic_events into walk directories so individual walk charts update."""
+    if not events or not data_root.exists():
+        return []
+
+    parsed_events: list[tuple[datetime, dict]] = []
+    for ev in events:
+        try:
+            dt = datetime.fromisoformat(str(ev["timestamp_utc"]).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            parsed_events.append((dt, ev))
+        except Exception:
+            continue
+
+    if not parsed_events:
+        return []
+
+    walks_updated: list[dict] = []
+    headers = [
+        "Index",
+        "Date",
+        "Time",
+        "Sensor Glucose (mmol/L)",
+        "Basal Rate (U/h)",
+        "Bolus Volume Delivered (U)",
+        "Suspend",
+        "Auto Mode",
+    ]
+
+    for walk_dir in _iter_walk_dirs(data_root):
+        meta = _load_walk_meta(walk_dir)
+        start_time_iso = meta.get("start_time")
+        if not start_time_iso:
+            continue
+        try:
+            walk_start = datetime.fromisoformat(str(start_time_iso).replace("Z", "+00:00"))
+            if walk_start.tzinfo is None:
+                walk_start = walk_start.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+
+        fit_files = list(walk_dir.glob("*.fit"))
+        if not fit_files:
+            walk_end = walk_start + timedelta(hours=1)
+        else:
+            try:
+                fit_start, fit_end = _fit_time_bounds(fit_files[0].read_bytes())
+            except Exception:
+                fit_start, fit_end = None, None
+            walk_start = fit_start if fit_start is not None else walk_start
+            walk_end = fit_end if fit_end is not None else (walk_start + timedelta(hours=1))
+
+        pad_start = walk_start - timedelta(minutes=30)
+        pad_end = walk_end + timedelta(minutes=60)
+
+        window_events = [(dt, ev) for dt, ev in parsed_events if pad_start <= dt <= pad_end]
+        if not window_events:
+            continue
+
+        window_events.sort(key=lambda pair: pair[0])
+        csv_path = walk_dir / csv_filename
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for idx, (dt, ev) in enumerate(window_events, start=1):
+                ev_type = ev.get("event_type")
+                writer.writerow([
+                    idx,
+                    dt.strftime("%Y/%m/%d"),
+                    dt.strftime("%H:%M:%S"),
+                    ev.get("bg_mmol") if ev_type == "cgm" and ev.get("bg_mmol") is not None else "",
+                    ev.get("basal_rate_u_hr") if ev_type == "basal" and ev.get("basal_rate_u_hr") is not None else "",
+                    ev.get("bolus_units") if ev_type == "bolus" and ev.get("bolus_units") is not None else "",
+                    ev.get("pump_state") if ev_type == "pump_state" and ev.get("pump_state") else "",
+                    "",
+                ])
+
+        meta["carelink_reused_from"] = None
+        meta["carelink_start_time"] = walk_start.isoformat()
+        meta["carelink_end_time"] = walk_end.isoformat()
+        (walk_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+        refresh_walk_analytics_if_needed(
+            meta["id"],
+            force=True,
+            find_walk_dir=lambda wid: _find_walk_dir(wid, data_root),
+            get_walk_analysis_data=lambda wid, persist_analytics=False: _get_walk_analysis_data(
+                wid,
+                persist_analytics=persist_analytics,
+                data_root=data_root,
+            ),
+        )
+        walks_updated.append({"id": meta["id"], "name": meta.get("name"), "date": meta.get("date")})
+
+    return walks_updated
+
+
 @app.post("/api/carelink/sync")
 def sync_carelink_data(
+    payload: dict | None = Body(default=None),
     user: dict = Depends(_require_user),
 ):
     user_sub = user['sub']
+    req = payload or {}
+    allowed_dates: set[str] | None = None
+    if req.get("start_date") or req.get("end_date"):
+        try:
+            date_list = resolve_sync_date_range(
+                start_date=req.get("start_date"),
+                end_date=req.get("end_date"),
+                default_days=7,
+                max_days=30,
+            )
+            allowed_dates = set(date_list)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     logger.info(f"Starting CareLink automated sync for user sub: {user_sub}")
     settings = get_user_settings(user_sub)
     if not settings or not settings.get("carelink_email"):
@@ -3693,7 +4128,27 @@ def sync_carelink_data(
     sgs = recent_data.get("sgs", [])
     markers = recent_data.get("markers", [])
     logger.info(f"Retrieved {len(sgs)} glucose readings and {len(markers)} markers from CareLink API")
-    
+
+    # Persist 24-hour glycemic_events for daily & range correlation views
+    normalized_events = normalize_carelink_api_payload(
+        recent_data,
+        allowed_dates=allowed_dates,
+    )
+    events_upserted = 0
+    if normalized_events:
+        events_upserted = upsert_glycemic_events(user_sub, normalized_events)
+        _, linked_by_date = _get_user_walk_windows_and_summaries(user_sub, data_root)
+        for d_str in sorted({ev["local_date"] for ev in normalized_events}):
+            try:
+                get_or_compute_daily_analytics(
+                    user_sub=user_sub,
+                    local_date=d_str,
+                    force=True,
+                    linked_walks=linked_by_date.get(d_str, []),
+                )
+            except Exception as exc:
+                logger.warning(f"Failed to recompute daily analytics for {d_str}: {exc}")
+
     walks_updated = []
     
     for walk_dir in _iter_walk_dirs(data_root):
@@ -3823,9 +4278,210 @@ def sync_carelink_data(
             ),
         )
         walks_updated.append({"id": meta["id"], "name": meta.get("name"), "date": meta.get("date")})
-        
-    logger.info(f"CareLink automated sync completed successfully. Synced {len(walks_updated)} walk(s).")
-    return {"status": "ok", "synced_walks": walks_updated}
+
+    settings["last_cgm_sync_at"] = datetime.now(timezone.utc).isoformat()
+    settings["cgm_provider"] = "carelink"
+    upsert_user_settings(user_sub, settings)
+
+    logger.info(f"CareLink automated sync completed successfully. Synced {len(walks_updated)} walk(s) and {events_upserted} event(s).")
+    return {
+        "status": "ok",
+        "events_upserted": events_upserted,
+        "synced_walks": walks_updated,
+    }
+
+
+@app.post("/api/dexcom/login")
+def dexcom_login_endpoint(
+    payload: dict = Body(...),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    region = (payload.get("region") or "ous").strip().lower()
+    if region not in ("us", "ous"):
+        raise HTTPException(status_code=400, detail="region must be 'us' or 'ous'")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="Dexcom username and password are required.")
+
+    data_root = _user_data_dir(user_sub)
+    token_path = data_root / ".dexcom" / "session.json"
+
+    try:
+        client = DexcomShareClient(
+            username=username,
+            password=password,
+            region=region,
+            token_path=token_path,
+        )
+        session_id = client.authenticate()
+    except Exception as exc:
+        logger.error(f"Dexcom login failed for user {user_sub}: {exc}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Dexcom authentication failed: {exc}")
+
+    settings = get_user_settings(user_sub) or {}
+    settings["dexcom_username"] = username
+    settings["dexcom_region"] = region
+    settings["cgm_provider"] = "dexcom"
+    upsert_user_settings(user_sub, settings)
+
+    return {
+        "status": "success",
+        "username": username,
+        "region": region,
+        "session_id": session_id,
+    }
+
+
+@app.post("/api/dexcom/sync")
+def dexcom_sync_endpoint(
+    payload: dict | None = Body(default=None),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    req = payload or {}
+    try:
+        sync_dates = resolve_sync_date_range(
+            start_date=req.get("start_date"),
+            end_date=req.get("end_date"),
+            default_days=7,
+            max_days=30,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    settings = get_user_settings(user_sub) or {}
+    username = settings.get("dexcom_username")
+    region = settings.get("dexcom_region") or "ous"
+    if not username:
+        raise HTTPException(status_code=400, detail="Dexcom Share not configured. Please connect in Settings.")
+
+    data_root = _user_data_dir(user_sub)
+    token_path = data_root / ".dexcom" / "session.json"
+    if not token_path.exists():
+        raise HTTPException(status_code=400, detail="Dexcom session file not found. Please reconnect.")
+
+    try:
+        client = DexcomShareClient(
+            username=username,
+            region=region,
+            token_path=token_path,
+        )
+        minutes = len(sync_dates) * 1440
+        max_count = len(sync_dates) * 288
+        events = client.fetch_glucose_readings(
+            minutes=minutes,
+            max_count=max_count,
+            allowed_dates=set(sync_dates) if (req.get("start_date") or req.get("end_date")) else None,
+        )
+    except Exception as exc:
+        logger.error(f"Dexcom sync failed for user {user_sub}: {exc}", exc_info=True)
+        raise HTTPException(status_code=401, detail=f"Dexcom sync failed: {exc}")
+
+    events_upserted = upsert_glycemic_events(user_sub, events) if events else 0
+    walks_updated = _sync_glycemic_events_to_overlapping_walks(
+        user_sub,
+        data_root,
+        events,
+        csv_filename="dexcom_sync.csv",
+    )
+
+    _, linked_by_date = _get_user_walk_windows_and_summaries(user_sub, data_root)
+    touched_dates = sorted({ev["local_date"] for ev in events})
+    for d_str in touched_dates:
+        try:
+            get_or_compute_daily_analytics(
+                user_sub=user_sub,
+                local_date=d_str,
+                force=True,
+                linked_walks=linked_by_date.get(d_str, []),
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to recompute daily analytics for {d_str}: {exc}")
+
+    settings["last_cgm_sync_at"] = datetime.now(timezone.utc).isoformat()
+    upsert_user_settings(user_sub, settings)
+
+    return {
+        "status": "ok",
+        "start_date": sync_dates[0],
+        "end_date": sync_dates[-1],
+        "events_upserted": events_upserted,
+        "days_updated": len(touched_dates),
+        "synced_walks": walks_updated,
+    }
+
+
+@app.post("/api/telemetry/import")
+async def import_telemetry_csv_endpoint(
+    file: UploadFile = File(...),
+    provider: str = Form("auto"),
+    tz_offset_mins: int = Form(0),
+    user: dict = Depends(_require_user),
+):
+    user_sub = user['sub']
+    raw_bytes = await file.read()
+    try:
+        csv_text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        csv_text = raw_bytes.decode("latin-1", errors="replace")
+
+    try:
+        detected_provider, source_unit, events = detect_and_parse_telemetry_csv(
+            csv_text=csv_text,
+            provider=provider,
+            tz_offset_mins=tz_offset_mins,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not events:
+        raise HTTPException(
+            status_code=400,
+            detail="No valid glucose, insulin, or carbohydrate records found in the uploaded CSV file.",
+        )
+
+    events_ingested = upsert_glycemic_events(user_sub, events)
+    data_root = _user_data_dir(user_sub)
+    walks_updated = _sync_glycemic_events_to_overlapping_walks(
+        user_sub,
+        data_root,
+        events,
+        csv_filename=f"{detected_provider}_import.csv",
+    )
+
+    _, linked_by_date = _get_user_walk_windows_and_summaries(user_sub, data_root)
+    touched_dates = sorted({ev["local_date"] for ev in events})
+    for d_str in touched_dates:
+        try:
+            get_or_compute_daily_analytics(
+                user_sub=user_sub,
+                local_date=d_str,
+                force=True,
+                linked_walks=linked_by_date.get(d_str, []),
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to recompute daily analytics for {d_str}: {exc}")
+
+    settings = get_user_settings(user_sub) or {}
+    settings["last_cgm_sync_at"] = datetime.now(timezone.utc).isoformat()
+    if not settings.get("cgm_provider") or settings.get("cgm_provider") == "none":
+        settings["cgm_provider"] = detected_provider
+    upsert_user_settings(user_sub, settings)
+
+    return {
+        "status": "ok",
+        "detected_provider": detected_provider,
+        "source_unit": source_unit,
+        "events_ingested": events_ingested,
+        "date_range": {
+            "start_date": touched_dates[0] if touched_dates else None,
+            "end_date": touched_dates[-1] if touched_dates else None,
+        },
+        "days_updated": len(touched_dates),
+        "walks_updated": len(walks_updated),
+    }
 
 
 @app.get("/api/system/logs")

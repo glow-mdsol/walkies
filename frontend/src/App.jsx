@@ -3,6 +3,7 @@ import { GoogleLogin } from '@react-oauth/google'
 import UploadForm from './components/UploadForm'
 import WalkList from './components/WalkList'
 import WalkAnalysisView from './components/WalkAnalysisView'
+import DailyAggregateView from './components/DailyAggregateView'
 import UserSettings from './components/UserSettings'
 import RouteCompare from './components/RouteCompare'
 import PersonasSection from './components/PersonasSection'
@@ -33,10 +34,31 @@ export default function App() {
   const [homeTab, setHomeTab] = useState('walks')
   const [syncingGarmin, setSyncingGarmin] = useState(false)
   const [syncingCarelink, setSyncingCarelink] = useState(false)
+  const [syncingDexcom, setSyncingDexcom] = useState(false)
+  const [syncStartDate, setSyncStartDate] = useState('')
+  const [syncEndDate, setSyncEndDate] = useState('')
+  const [sharedDailyPayload, setSharedDailyPayload] = useState(null)
   const [shareToken, setShareToken] = useState(() => {
     const params = new URLSearchParams(window.location.search)
     return params.get('share') || null
   })
+
+  useEffect(() => {
+    if (!shareToken) {
+      setSharedDailyPayload(null)
+      return
+    }
+    fetch(`/api/shared/${encodeURIComponent(shareToken)}/analysis`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data && (data.share_type === 'daily' || data.share_type === 'range')) {
+          setSharedDailyPayload(data)
+        } else {
+          setSharedDailyPayload(null)
+        }
+      })
+      .catch(() => setSharedDailyPayload(null))
+  }, [shareToken])
 
   const apiFetch = useCallback((url, options = {}) => {
     if (!idToken) throw new Error('Not authenticated')
@@ -47,20 +69,32 @@ export default function App() {
     return fetch(url, { ...options, headers })
   }, [idToken])
 
+  const buildSyncRangeBody = () => {
+    const body = {}
+    if (syncStartDate) body.start_date = syncStartDate
+    if (syncEndDate) body.end_date = syncEndDate
+    return body
+  }
+
   const handleGarminSync = async () => {
     setSyncingGarmin(true)
     setError(null)
     try {
-      const res = await apiFetch('/api/garmin/sync', { method: 'POST' })
+      const res = await apiFetch('/api/garmin/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildSyncRangeBody()),
+      })
       const payload = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(payload.detail || 'Sync failed')
 
       const count = payload.imported?.length ?? 0
-      if (count > 0) {
-        alert(`Successfully synced and imported ${count} new walk(s) from Garmin!`)
+      const epochsCount = payload.epochs_upserted ?? 0
+      if (count > 0 || epochsCount > 0) {
+        alert(`Garmin sync complete: ${count} new walk(s) and ${epochsCount} 15-min epochs synced!`)
         fetchWalks()
       } else {
-        alert('All Garmin activities are already up-to-date.')
+        alert('All Garmin activities and epochs are already up-to-date.')
       }
     } catch (err) {
       setError(err.message || 'Sync failed')
@@ -73,21 +107,46 @@ export default function App() {
     setSyncingCarelink(true)
     setError(null)
     try {
-      const res = await apiFetch('/api/carelink/sync', { method: 'POST' })
+      const res = await apiFetch('/api/carelink/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildSyncRangeBody()),
+      })
       const payload = await res.json().catch(() => ({}))
       if (!res.ok) throw new Error(payload.detail || 'Sync failed')
 
       const count = payload.synced_walks?.length ?? 0
-      if (count > 0) {
-        alert(`Successfully synced and updated glucose overlay for ${count} walk(s) from CareLink!`)
+      const eventsCount = payload.events_upserted ?? 0
+      if (count > 0 || eventsCount > 0) {
+        alert(`CareLink sync complete: ${eventsCount} telemetry events and ${count} walk(s) updated!`)
         fetchWalks()
       } else {
-        alert('All Garmin walks are already up-to-date with CareLink glucose data.')
+        alert('All Garmin walks and daily views are already up-to-date with CareLink data.')
       }
     } catch (err) {
       setError(err.message || 'Sync failed')
     } finally {
       setSyncingCarelink(false)
+    }
+  }
+
+  const handleDexcomSync = async () => {
+    setSyncingDexcom(true)
+    setError(null)
+    try {
+      const res = await apiFetch('/api/dexcom/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildSyncRangeBody()),
+      })
+      const payload = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(payload.detail || 'Dexcom sync failed')
+      alert(`Dexcom sync complete: ${payload.events_upserted ?? 0} CGM readings synced!`)
+      fetchWalks()
+    } catch (err) {
+      setError(err.message || 'Dexcom sync failed')
+    } finally {
+      setSyncingDexcom(false)
     }
   }
 
@@ -255,11 +314,20 @@ export default function App() {
       <main className="app-main">
         {error && <div className="error-banner">{error}</div>}
         {shareToken ? (
-          <WalkAnalysisView
-            shareToken={shareToken}
-            insulinProfile={null}
-            apiFetch={null}
-          />
+          sharedDailyPayload ? (
+            <DailyAggregateView
+              shareToken={shareToken}
+              sharedInitialData={sharedDailyPayload}
+              userSettings={sharedDailyPayload.user_settings}
+              apiFetch={null}
+            />
+          ) : (
+            <WalkAnalysisView
+              shareToken={shareToken}
+              insulinProfile={null}
+              apiFetch={null}
+            />
+          )
         ) : !idToken ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
           <section className="card" style={{ textAlign: 'center', padding: '2.5rem 2rem', background: 'linear-gradient(180deg, var(--surface) 0%, var(--surface-tint) 100%)', maxWidth: '640px', margin: '0 auto', width: '100%' }}>
@@ -359,6 +427,7 @@ export default function App() {
           <WalkAnalysisView
             walkId={selectedWalkId}
             insulinProfile={userSettings?.insulin_profile}
+            userSettings={userSettings}
             apiFetch={apiFetch}
             onRenamed={fetchWalks}
           />
@@ -377,46 +446,102 @@ export default function App() {
                 Walks
               </button>
               <button
+                className={`home-tab${homeTab === 'daily' ? ' home-tab--active' : ''}`}
+                onClick={() => setHomeTab('daily')}
+              >
+                Daily & Trends
+              </button>
+              <button
                 className={`home-tab${homeTab === 'new-walk' ? ' home-tab--active' : ''}`}
                 onClick={() => setHomeTab('new-walk')}
               >
-                New Walk
+                New Walk / Import
               </button>
             </div>
-            {homeTab === 'walks' && userSettings?.garmin_email && (
-              <section className="card" style={{ padding: '0.75rem 1rem', marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.95rem', color: 'var(--text-muted)' }}>
-                  Connected to Garmin: <strong>{userSettings.garmin_email}</strong>
-                </span>
-                <button
-                  className="btn-primary"
-                  onClick={handleGarminSync}
-                  disabled={syncingGarmin}
-                  style={{ padding: '0.45rem 1rem', fontSize: '0.85rem' }}
-                >
-                  {syncingGarmin ? 'Syncing...' : '🔄 Sync Garmin Walks'}
-                </button>
+            {(homeTab === 'walks' || homeTab === 'daily') && (userSettings?.garmin_email || userSettings?.carelink_email || userSettings?.dexcom_username) && (
+              <section className="card" style={{ padding: '0.75rem 1rem', marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', justifyContent: 'space-between', alignItems: 'center', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap', fontSize: '0.83rem', color: 'var(--text-muted)' }}>
+                    <span>Sync Window (default 7d, max 30d):</span>
+                    <input
+                      type="date"
+                      value={syncStartDate}
+                      onChange={(e) => setSyncStartDate(e.target.value)}
+                      style={{ padding: '0.25rem 0.45rem', borderRadius: 'var(--radius)', border: '1px solid var(--border)', fontSize: '0.8rem' }}
+                    />
+                    <span>to</span>
+                    <input
+                      type="date"
+                      value={syncEndDate}
+                      onChange={(e) => setSyncEndDate(e.target.value)}
+                      style={{ padding: '0.25rem 0.45rem', borderRadius: 'var(--radius)', border: '1px solid var(--border)', fontSize: '0.8rem' }}
+                    />
+                    {(syncStartDate || syncEndDate) && (
+                      <button
+                        className="btn-secondary"
+                        onClick={() => { setSyncStartDate(''); setSyncEndDate('') }}
+                        style={{ padding: '0.2rem 0.5rem', fontSize: '0.78rem' }}
+                      >
+                        Reset (7d)
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    {userSettings?.garmin_email && (
+                      <button
+                        className="btn-primary"
+                        onClick={handleGarminSync}
+                        disabled={syncingGarmin}
+                        style={{ padding: '0.45rem 0.9rem', fontSize: '0.84rem' }}
+                      >
+                        {syncingGarmin ? 'Syncing Garmin...' : '🔄 Sync Garmin (Walks + 15m Epochs)'}
+                      </button>
+                    )}
+                    {userSettings?.carelink_email && (
+                      <button
+                        className="btn-primary"
+                        onClick={handleCarelinkSync}
+                        disabled={syncingCarelink}
+                        style={{ padding: '0.45rem 0.9rem', fontSize: '0.84rem' }}
+                      >
+                        {syncingCarelink ? 'Syncing CareLink...' : '🔄 Sync CareLink'}
+                      </button>
+                    )}
+                    {userSettings?.dexcom_username && (
+                      <button
+                        className="btn-primary"
+                        onClick={handleDexcomSync}
+                        disabled={syncingDexcom}
+                        style={{ padding: '0.45rem 0.9rem', fontSize: '0.84rem' }}
+                      >
+                        {syncingDexcom ? 'Syncing Dexcom...' : '🔄 Sync Dexcom CGM'}
+                      </button>
+                    )}
+                  </div>
+                </div>
               </section>
             )}
-            {homeTab === 'walks' && userSettings?.carelink_email && (
-              <section className="card" style={{ padding: '0.75rem 1rem', marginTop: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: '0.95rem', color: 'var(--text-muted)' }}>
-                  Connected to CareLink: <strong>{userSettings.carelink_email}</strong>
-                </span>
-                <button
-                  className="btn-primary"
-                  onClick={handleCarelinkSync}
-                  disabled={syncingCarelink}
-                  style={{ padding: '0.45rem 1rem', fontSize: '0.85rem' }}
-                >
-                  {syncingCarelink ? 'Syncing...' : '🔄 Sync CareLink Glucose'}
-                </button>
-              </section>
+            {homeTab === 'walks' ? (
+              <WalkList
+                walks={walks}
+                onDeleted={fetchWalks}
+                onView={setSelectedWalkId}
+                apiFetch={apiFetch}
+                glucoseUnit={userSettings?.glucose_unit || 'mmol/L'}
+              />
+            ) : homeTab === 'daily' ? (
+              <DailyAggregateView
+                apiFetch={apiFetch}
+                userSettings={userSettings}
+                onSelectWalk={setSelectedWalkId}
+              />
+            ) : (
+              <UploadForm
+                onUploaded={() => { fetchWalks(); setHomeTab('walks') }}
+                apiFetch={apiFetch}
+                garminEmail={userSettings?.garmin_email}
+              />
             )}
-            {homeTab === 'walks'
-              ? <WalkList walks={walks} onDeleted={fetchWalks} onView={setSelectedWalkId} apiFetch={apiFetch} />
-              : <UploadForm onUploaded={() => { fetchWalks(); setHomeTab('walks') }} apiFetch={apiFetch} garminEmail={userSettings?.garmin_email} />
-            }
           </>
         )}
       </main>

@@ -1,3 +1,5 @@
+import { formatGlucoseDelta } from '../utils/glucoseUnits'
+
 function fmt(v, d = 1, s = '') {
   if (v == null || Number.isNaN(v)) return null
   return `${Number(v).toFixed(d)}${s}`
@@ -10,11 +12,6 @@ function fmtDuration(h) {
   return hours > 0 ? `${hours}h ${mins}m` : `${mins}m`
 }
 
-function fmtBgDelta(v) {
-  if (v == null) return null
-  return `${v > 0 ? '+' : ''}${Number(v).toFixed(1)} mmol/L`
-}
-
 function MetricPill({ label, value }) {
   if (value == null) return null
   return (
@@ -25,7 +22,7 @@ function MetricPill({ label, value }) {
   )
 }
 
-function WalkCard({ walk, onDeleted, onView, apiFetch }) {
+function WalkCard({ walk, onDeleted, onView, apiFetch, glucoseUnit = 'mmol/L' }) {
   const m = walk.metrics
 
   const handleDelete = async () => {
@@ -58,7 +55,7 @@ function WalkCard({ walk, onDeleted, onView, apiFetch }) {
           <MetricPill label="Distance" value={fmt(m.distance_km, 1, ' km')} />
           <MetricPill label="Duration" value={fmtDuration(m.duration_h)} />
           <MetricPill label="Avg HR" value={fmt(m.avg_hr, 0, ' bpm')} />
-          <MetricPill label="BG Δ" value={fmtBgDelta(m.bg_delta)} />
+          <MetricPill label="BG Δ" value={formatGlucoseDelta(m.bg_delta, glucoseUnit)} />
           <MetricPill label="TiR" value={fmt(m.tir_pct, 0, '%')} />
         </div>
       ) : (
@@ -68,7 +65,7 @@ function WalkCard({ walk, onDeleted, onView, apiFetch }) {
   )
 }
 
-export default function WalkList({ walks, onDeleted, onView, apiFetch }) {
+export default function WalkList({ walks, onDeleted, onView, apiFetch, glucoseUnit = 'mmol/L' }) {
   if (!walks.length) {
     return <p className="empty">No walks yet — upload some files above.</p>
   }
@@ -76,7 +73,7 @@ export default function WalkList({ walks, onDeleted, onView, apiFetch }) {
   return (
     <section className="walk-list">
       {walks.map(w => (
-        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} onView={onView} apiFetch={apiFetch} />
+        <WalkCard key={w.id} walk={w} onDeleted={onDeleted} onView={onView} apiFetch={apiFetch} glucoseUnit={glucoseUnit} />
       ))}
     </section>
   )

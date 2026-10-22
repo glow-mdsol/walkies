@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## About this project
 
-Geoffrey Low is a Type 1 diabetic (MiniMed 780G MMT-1885 pump + Guardian 4 CGM, mostly in closed-loop AUTO mode) who is an active walker/hiker. This app stores per-walk activity files and generates analyses correlating GPS/activity metrics with glucose, insulin, and pump events.
+Walkies is an open-source web application for active walkers/hikers with diabetes across all regimens (Closed-Loop AID Pump such as MiniMed 780G / Tandem Control-IQ, Standard Pump, Multiple Daily Injections / MDI, and Non-Insulin / Lifestyle therapy, as well as Non-Diabetic CGM users). The app stores per-walk activity files as well as 24-hour Garmin 15-minute intraday step/activity epochs and multi-provider CGM/insulin streams (Medtronic CareLink, Dexcom Share/Clarity, Tandem t:connect), generating both per-walk and 24-hour / multi-day aggregate analyses.
 
 ## Commands & Testing
 
@@ -38,11 +38,17 @@ walkies/
 │   ├── pyproject.toml         # UV/Python dependencies
 │   ├── uv.lock                # UV lockfile
 │   ├── Dockerfile             # Container definition for deployment
+│   ├── telemetry/             # Multi-provider activity & CGM/insulin normalizers & clients
+│   │   ├── common.py          # Canonical mmol/L <-> mg/dL conversion & UTC timestamp helpers
+│   │   ├── garmin_epochs.py   # Garmin 15-min intraday epoch & daily summary fetcher/normalizer
+│   │   ├── carelink_normalizer.py # Medtronic CareLink 24h API & CSV normalizer
+│   │   ├── dexcom_client.py   # Dexcom Share cloud client (US/OUS) & Clarity CSV parser
+│   │   └── tandem_parser.py   # Tandem t:connect CSV parser & multi-provider CSV auto-detector
 │   ├── analytics/             # Analytics engine, DB persistence, caching & migrations
-│   │   ├── db.py              # SQLite/PostgreSQL engine (walk_analytics, share_links, user_settings, system_logs)
+│   │   ├── db.py              # SQLite/PostgreSQL engine (walk_analytics, daily_analytics, activity_epochs, glycemic_events, share_links, user_settings, system_logs)
 │   │   ├── migrate.py         # UUID walk ID migration & database schema maintenance
 │   │   ├── service.py         # Caching and recomputation orchestration
-│   │   └── models/            # Domain models (exercise risk, stress decoupling, etc.)
+│   │   └── models/            # Domain models (daily_correlation, exercise risk, stress decoupling, etc.)
 │   ├── sources_review/        # Academic literature review and research digest tools
 │   ├── data/                  # Local data storage (gitignored)
 │   │   └── {user_sub}/        # User-isolated data partition
@@ -54,7 +60,8 @@ walkies/
     ├── vite.config.js         # dev proxy: /api → http://localhost:8000
     └── src/
         ├── App.jsx            # Main app shell, navigation, Google OAuth state
-        └── components/        # UI components (AnalysisView, DynamicWalkMap, GarminSyncModal, CarelinkSyncModal, SettingsView, SystemLogsSection, etc.)
+        ├── utils/             # glucoseUnits.js (mmol/L <-> mg/dL conversion & formatting)
+        └── components/        # UI components (WalkAnalysisView, DailyAggregateView, GarminSyncModal, CarelinkSyncModal, DexcomSyncModal, UserSettings, SystemLogsSection, etc.)
 ```
 
 ### Key API Routes
@@ -69,13 +76,20 @@ walkies/
 | POST | `/api/walks/{walk_id}/rate` | Rate a walk 1–5 stars |
 | POST | `/api/walks/{walk_id}/share-links` | Generate public share link for a walk |
 | GET | `/api/walks/{walk_id}/share-links` | List active share links for walk |
+| GET | `/api/daily/{date}/analysis` | 24-hour epochal step/activity & CGM/insulin correlation (cached with ETag) |
+| GET | `/api/daily/range` | Multi-day aggregate summary (`start_date`, `end_date` up to 90 days) |
+| POST | `/api/daily/share-links` | Generate public share link for a single day (`daily`) or date range (`range`) |
+| GET | `/api/daily/share-links` | List active share links for daily/range summaries |
 | DELETE | `/api/share-links/{token}` | Revoke a public share link |
-| GET | `/api/shared/{token}/analysis` | Public read-only analysis endpoint (no login required) |
-| GET/POST | `/api/settings` | Get/update user diabetic profile and treatment parameters |
+| GET | `/api/shared/{token}/analysis` | Public read-only analysis endpoint for walk, daily, or range share links |
+| GET/POST | `/api/user/settings` | Get/update user diabetic regimen, glucose unit (`mmol/L`/`mg/dL`), and thresholds |
 | POST | `/api/garmin/login` | Authenticate Garmin Connect (supports 2FA / MFA verification) |
-| POST | `/api/garmin/sync` | Sync and import walking FIT files from Garmin Connect |
+| POST | `/api/garmin/sync` | Sync walking FIT files and 15-min intraday epochs from Garmin Connect (7-day default or up to 30-day custom range) |
 | POST | `/api/carelink/upload-token` | Upload CareLink authentication token file |
-| POST | `/api/carelink/sync` | Automatically sync CGM and pump events from CareLink |
+| POST | `/api/carelink/sync` | Sync 24h CGM and pump events from CareLink into `glycemic_events` and walks |
+| POST | `/api/dexcom/login` | Authenticate Dexcom Share (`us` or `ous` region) |
+| POST | `/api/dexcom/sync` | Sync CGM readings from Dexcom Share (7-day default or up to 30-day range) |
+| POST | `/api/telemetry/import` | Upload & auto-detect Medtronic CareLink, Dexcom Clarity, or Tandem t:connect CSV |
 | GET/DELETE | `/api/system/logs` | Query or clear diagnostic and application event logs |
 
 ### File Storage & Isolation

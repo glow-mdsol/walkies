@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback } from 'react'
 const today = () => new Date().toISOString().slice(0, 10)
 
 export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
-  // Mode: 'garmin' | 'manual'
+  // Mode: 'garmin' | 'manual' | 'telemetry'
   const [mode, setMode] = useState(() => (garminEmail ? 'garmin' : 'manual'))
 
   // Form fields
@@ -13,6 +13,8 @@ export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
   const [fitFile, setFitFile] = useState(null)
   const [carelinkFile, setCarelinkFile] = useState(null)
   const [gpxFile, setGpxFile] = useState(null)
+  const [telemetryFile, setTelemetryFile] = useState(null)
+  const [telemetryProvider, setTelemetryProvider] = useState('auto')
   const [uploading, setUploading] = useState(false)
   const [message, setMessage] = useState(null)
 
@@ -123,6 +125,26 @@ export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
         setGpxFile(null)
         setSelectedActivityId('')
         onUploaded()
+      } else if (mode === 'telemetry') {
+        if (!telemetryFile) {
+          throw new Error('Please choose a CareLink, Dexcom Clarity, or Tandem t:connect CSV file.')
+        }
+        const form = new FormData()
+        form.append('file', telemetryFile)
+        form.append('provider', telemetryProvider)
+        form.append('tz_offset_mins', String(-new Date().getTimezoneOffset()))
+
+        const res = await apiFetch('/api/telemetry/import', { method: 'POST', body: form })
+        const data = await res.json().catch(() => ({}))
+        if (!res.ok) {
+          throw new Error(data.detail || 'Telemetry CSV import failed')
+        }
+        setMessage(
+          `Imported ${data.events_ingested} records (${data.detected_provider?.toUpperCase()}, source unit: ${data.source_unit}) across ${data.days_updated} day(s) and updated ${data.walks_updated} walk(s)!`
+        )
+        setTelemetryFile(null)
+        e.target.reset()
+        onUploaded()
       } else {
         // Manual file upload
         const form = new FormData()
@@ -163,10 +185,10 @@ export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
   return (
     <section className="card upload-card" style={{ maxWidth: '640px' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap', gap: '0.5rem' }}>
-        <h2 style={{ margin: 0 }}>Add Walk</h2>
+        <h2 style={{ margin: 0 }}>{mode === 'telemetry' ? 'Import CGM / Pump CSV' : 'Add Walk'}</h2>
 
-        {garminEmail ? (
-          <div style={{ display: 'flex', gap: '0.35rem', background: 'var(--surface-tint)', padding: '0.2rem', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
+        <div style={{ display: 'flex', gap: '0.35rem', background: 'var(--surface-tint)', padding: '0.2rem', borderRadius: 'var(--radius)', border: '1px solid var(--border)', flexWrap: 'wrap' }}>
+          {garminEmail && (
             <button
               type="button"
               className="btn-secondary"
@@ -183,28 +205,40 @@ export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
             >
               ⌚ Select from Garmin
             </button>
-            <button
-              type="button"
-              className="btn-secondary"
-              onClick={() => setMode('manual')}
-              style={{
-                padding: '0.3rem 0.75rem',
-                fontSize: '0.82rem',
-                borderRadius: '6px',
-                border: 'none',
-                background: mode === 'manual' ? 'var(--primary)' : 'transparent',
-                color: mode === 'manual' ? '#fff' : 'var(--text)',
-                fontWeight: mode === 'manual' ? 600 : 400,
-              }}
-            >
-              📁 Upload FIT File
-            </button>
-          </div>
-        ) : (
-          <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-            Manual Upload
-          </span>
-        )}
+          )}
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setMode('manual')}
+            style={{
+              padding: '0.3rem 0.75rem',
+              fontSize: '0.82rem',
+              borderRadius: '6px',
+              border: 'none',
+              background: mode === 'manual' ? 'var(--primary)' : 'transparent',
+              color: mode === 'manual' ? '#fff' : 'var(--text)',
+              fontWeight: mode === 'manual' ? 600 : 400,
+            }}
+          >
+            📁 Upload FIT Walk
+          </button>
+          <button
+            type="button"
+            className="btn-secondary"
+            onClick={() => setMode('telemetry')}
+            style={{
+              padding: '0.3rem 0.75rem',
+              fontSize: '0.82rem',
+              borderRadius: '6px',
+              border: 'none',
+              background: mode === 'telemetry' ? 'var(--primary)' : 'transparent',
+              color: mode === 'telemetry' ? '#fff' : 'var(--text)',
+              fontWeight: mode === 'telemetry' ? 600 : 400,
+            }}
+          >
+            📊 Import CGM / Pump CSV
+          </button>
+        </div>
       </div>
 
       {!garminEmail && (
@@ -214,6 +248,47 @@ export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
       )}
 
       <form onSubmit={handleSubmit} className="upload-form">
+        {mode === 'telemetry' ? (
+          <>
+            <div className="field">
+              <label htmlFor="telemetry-provider">Telemetry Source Format</label>
+              <select
+                id="telemetry-provider"
+                className="setup-text-input"
+                value={telemetryProvider}
+                onChange={(e) => setTelemetryProvider(e.target.value)}
+                style={{ width: '100%', padding: '0.5rem', fontSize: '0.9rem' }}
+              >
+                <option value="auto">Auto-Detect (Medtronic CareLink, Dexcom Clarity, or Tandem t:connect)</option>
+                <option value="carelink">Medtronic CareLink CSV</option>
+                <option value="dexcom">Dexcom Clarity CSV (mg/dL or mmol/L)</option>
+                <option value="tandem">Tandem t:connect CSV</option>
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="telemetry-csv">CSV Telemetry File</label>
+              <input
+                id="telemetry-csv"
+                type="file"
+                accept=".csv"
+                onChange={(e) => setTelemetryFile(e.target.files[0] ?? null)}
+                required
+              />
+              <span className="hint">
+                Imports 24-hour CGM readings, boluses, basal rates, carbs, and pump automation states into Daily Trends and overlapping walks.
+              </span>
+            </div>
+            <button
+              type="submit"
+              disabled={uploading || !telemetryFile}
+              className="btn-primary"
+              style={{ padding: '0.6rem 1.4rem', fontSize: '0.95rem' }}
+            >
+              {uploading ? 'Importing Telemetry…' : 'Import Telemetry CSV'}
+            </button>
+          </>
+        ) : (
+        <>
         {mode === 'garmin' && garminEmail ? (
           <div className="field" style={{ background: '#f8fafc', padding: '0.85rem', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
@@ -358,6 +433,8 @@ export default function UploadForm({ onUploaded, apiFetch, garminEmail }) {
             ? (mode === 'garmin' ? 'Importing from Garmin…' : 'Uploading…')
             : (mode === 'garmin' ? 'Import Walk from Garmin' : 'Upload Walk')}
         </button>
+        </>
+        )}
       </form>
       {message && <p className={message.startsWith('Error') ? 'msg-error' : 'msg-ok'} style={{ marginTop: '1rem' }}>{message}</p>}
     </section>

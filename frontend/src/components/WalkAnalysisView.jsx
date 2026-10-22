@@ -22,6 +22,13 @@ import {
   CircleMarker,
   Tooltip as LeafletTooltip,
 } from 'react-leaflet'
+import {
+  mmolToDisplay,
+  mmolDeltaToDisplay,
+  formatGlucose,
+  formatGlucoseDelta,
+  formatGlucoseSlope,
+} from '../utils/glucoseUnits'
 
 function buildIobFn(profile) {
   const onset_s = profile.onsetMins * 60
@@ -473,11 +480,21 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
 
   const metrics = data?.metrics || {}
   const userSettings = data?.user_settings || {}
-  const userType = userSettings.user_type || (userSettings.insulin_type === 'Pump' ? 'diabetic_pump' : userSettings.insulin_type === 'MDI' ? 'diabetic_mdi' : 'non_diabetic')
+  const glucoseUnit = userSettings.glucose_unit === 'mg/dL' ? 'mg/dL' : 'mmol/L'
+  const bgDecimals = glucoseUnit === 'mg/dL' ? 0 : 1
+  const bgSlopeDecimals = glucoseUnit === 'mg/dL' ? 0 : 2
+  const userType = userSettings.user_type || (
+    userSettings.insulin_type === 'ClosedLoopPump' ? 'diabetic_closed_loop'
+      : userSettings.insulin_type === 'Pump' ? 'diabetic_pump'
+        : userSettings.insulin_type === 'MDI' ? 'diabetic_mdi'
+          : userSettings.insulin_type === 'OralOrLifestyle' ? 'diabetic_lifestyle'
+            : 'non_diabetic'
+  )
 
-  const hasCGM = userType === 'diabetic_pump' || userType === 'diabetic_mdi' || userType === 'non_diabetic_cgm'
-  const hasInsulin = userType === 'diabetic_pump' || userType === 'diabetic_mdi'
-  const hasPump = userType === 'diabetic_pump'
+  const hasCGM = ['diabetic_closed_loop', 'diabetic_pump', 'diabetic_mdi', 'diabetic_lifestyle', 'non_diabetic_cgm'].includes(userType)
+  const hasInsulin = ['diabetic_closed_loop', 'diabetic_pump', 'diabetic_mdi'].includes(userType)
+  const hasPump = ['diabetic_closed_loop', 'diabetic_pump'].includes(userType)
+  const hasClosedLoop = userType === 'diabetic_closed_loop' || userSettings.insulin_type === 'ClosedLoopPump'
 
   useEffect(() => {
     if (!hasCGM && analysisTab !== 'general') {
@@ -630,10 +647,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
     return Array.from(byDistance.values())
       .map((row) => ({
         ...row,
+        bg: row.bg != null ? mmolToDisplay(row.bg, glucoseUnit, bgDecimals) : null,
         bolus_display: row.bolus == null ? null : Math.min(Number(row.bolus), INSULIN_AXIS_MAX),
       }))
       .sort((a, b) => a.distance_km - b.distance_km)
-  }, [activityRows, glucoseRows, basalRows, bolusRows])
+  }, [activityRows, glucoseRows, basalRows, bolusRows, glucoseUnit, bgDecimals])
 
   const elevationHrBgChartRows = useMemo(() => {
     const byDistance = new Map()
@@ -656,12 +674,12 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
         hr: null,
         bg: null,
       }
-      existing.bg = row.bg ?? null
+      existing.bg = row.bg != null ? mmolToDisplay(row.bg, glucoseUnit, bgDecimals) : null
       byDistance.set(row.distance_km, existing)
     })
 
     return Array.from(byDistance.values()).sort((a, b) => a.distance_km - b.distance_km)
-  }, [activityRows, glucoseRows])
+  }, [activityRows, glucoseRows, glucoseUnit, bgDecimals])
 
   const glucoseInsulinChartRows = useMemo(() => {
     if (!glucoseChartRows.length) return []
@@ -854,8 +872,21 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
     [trendChartRows],
   )
 
-  const phaseRows = useMemo(() => payload?.phaseAnalytics?.phases || [], [payload?.phaseAnalytics])
-  const intensityRows = useMemo(() => payload?.intensityAnalytics || [], [payload?.intensityAnalytics])
+  const phaseRows = useMemo(
+    () => (payload?.phaseAnalytics?.phases || []).map((p) => ({
+      ...p,
+      slope_display: p.slope_per_hour != null ? mmolDeltaToDisplay(p.slope_per_hour, glucoseUnit, bgSlopeDecimals) : null,
+    })),
+    [payload?.phaseAnalytics, glucoseUnit, bgSlopeDecimals],
+  )
+  const intensityRows = useMemo(
+    () => (payload?.intensityAnalytics || []).map((r) => ({
+      ...r,
+      bg_std_display: r.bg_std != null ? mmolDeltaToDisplay(r.bg_std, glucoseUnit, bgSlopeDecimals) : null,
+      bg_slope_display: r.bg_slope_per_hour != null ? mmolDeltaToDisplay(r.bg_slope_per_hour, glucoseUnit, bgSlopeDecimals) : null,
+    })),
+    [payload?.intensityAnalytics, glucoseUnit, bgSlopeDecimals],
+  )
   const riskProfile = useMemo(() => payload?.riskProfile || null, [payload])
   const recoveryPhases = useMemo(() => payload?.recoveryPhases || [], [payload])
   const sensorGaps = useMemo(() => payload?.sensorGaps || [], [payload])
@@ -876,7 +907,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
       const during = phaseRows.find((p) => p.key === 'during')
       if (during?.slope_per_hour != null) {
         const trend = Number(during.slope_per_hour) < -0.2 ? 'falling' : Number(during.slope_per_hour) > 0.2 ? 'rising' : 'stable'
-        lines.push(`During-walk glucose trend is ${trend} (${fmt(during.slope_per_hour, 2)} mmol/L per hour).`)
+        lines.push(`During-walk glucose trend is ${trend} (${formatGlucoseSlope(during.slope_per_hour, glucoseUnit)}).`)
       }
 
       const topZone = [...intensityRows]
@@ -888,7 +919,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
     }
 
     return lines
-  }, [metrics.weather_stress_band, metrics.weather_stress_score, stressSummary.band, stressSummary.score, hasBgInsights, phaseRows, intensityRows])
+  }, [metrics.weather_stress_band, metrics.weather_stress_score, stressSummary.band, stressSummary.score, hasBgInsights, phaseRows, intensityRows, glucoseUnit])
 
   if (loading) {
     return (
@@ -1282,7 +1313,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
       ) : (
         <>
           <section className="analysis-stats-grid">
-            <Stat label="BG Delta" value={fmt(metrics.bg_delta, 2, ' mmol/L')} />
+            <Stat label="BG Delta" value={formatGlucoseDelta(metrics.bg_delta, glucoseUnit)} />
             <Stat label="Time in range" value={fmt(metrics.tir_pct, 0, '%')} />
             {hasInsulin && (
               <Stat
@@ -1292,7 +1323,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             )}
             {hasPump && (
               <Stat
-                label="SmartGuard"
+                label={hasClosedLoop ? 'AID / SmartGuard' : 'Pump Suspend'}
                 value={smartguardSummary.any_activity ? `${fmt(smartguardSummary.predicted_low_suspend_count, 0)} predicted-low` : 'No events'}
               />
             )}
@@ -1318,12 +1349,12 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                   <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
                   <YAxis yAxisId="alt" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" m" />
                   <YAxis yAxisId="hr" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} tickFormatter={(v) => num(v, 0)} unit=" bpm" />
-                  <YAxis yAxisId="bg" orientation="right" width={0} hide tickFormatter={(v) => num(v, 1)} unit=" mmol/L" />
+                  <YAxis yAxisId="bg" orientation="right" width={0} hide tickFormatter={(v) => num(v, bgDecimals)} unit={` ${glucoseUnit}`} />
                   <Tooltip labelFormatter={(v) => `${num(v, 2)} km`} />
                   <Legend />
                   <Line yAxisId="alt" type="monotone" dataKey="altitude_m" name="Altitude" stroke="#5a6f85" dot={false} strokeWidth={2} connectNulls />
                   <Line yAxisId="hr" type="monotone" dataKey="hr" name="HR" stroke="#ef5b0c" dot={false} strokeWidth={2} connectNulls />
-                  <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
+                  <Line yAxisId="bg" type="monotone" dataKey="bg" name={`BG (${glucoseUnit})`} stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
                 </LineChart>
               </ResponsiveContainer>
             </ChartCard>
@@ -1444,7 +1475,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             >
               <CartesianGrid strokeDasharray="3 3" stroke="#e5ebf1" />
               <XAxis dataKey="distance_km" type="number" domain={distanceDomain} ticks={distanceTicks} allowDataOverflow tickFormatter={formatDistanceTick} unit=" km" />
-              <YAxis yAxisId="bg" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, 1)} unit=" mmol/L" />
+              <YAxis yAxisId="bg" orientation="left" width={DISTANCE_LEFT_Y_WIDTH} tickFormatter={(v) => num(v, bgDecimals)} unit={` ${glucoseUnit}`} />
               {hasInsulin && (
                 <YAxis yAxisId="ins" orientation="right" width={DISTANCE_RIGHT_Y_WIDTH} domain={[0, INSULIN_AXIS_MAX]} tickFormatter={(v) => num(v, 1)} unit=" U/h" />
               )}
@@ -1501,7 +1532,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                   />
                 )
               })}
-              <Line yAxisId="bg" type="monotone" dataKey="bg" name="BG" stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
+              <Line yAxisId="bg" type="monotone" dataKey="bg" name={`BG (${glucoseUnit})`} stroke="#7d00b8" dot={false} strokeWidth={2} connectNulls />
               {hasInsulin && (
                 <>
                   <Area yAxisId="ins" type="stepAfter" dataKey="basal" name="Basal rate" stroke="#00745a" fill="rgba(0,116,90,0.22)" connectNulls strokeWidth={1.8} />
@@ -1534,9 +1565,9 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                   <BarChart data={phaseRows} margin={{ top: 20, right: 16, left: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                     <XAxis dataKey="label" tick={{ fontSize: 11, fill: '#aaa' }} />
-                    <YAxis tick={{ fontSize: 11, fill: '#aaa' }} unit=" mmol/L/h" width={70} />
-                    <Tooltip formatter={(v) => [`${fmt(v, 2)} mmol/L per hour`, 'Slope']} />
-                    <Bar dataKey="slope_per_hour" name="BG slope" label={{ position: 'top', fontSize: 10, fill: '#ccc', formatter: (v) => fmt(v, 2) }}>
+                    <YAxis tick={{ fontSize: 11, fill: '#aaa' }} unit={` ${glucoseUnit}/h`} width={70} />
+                    <Tooltip formatter={(v) => [`${fmt(v, bgSlopeDecimals)} ${glucoseUnit}/h`, 'Slope']} />
+                    <Bar dataKey="slope_display" name="BG slope" label={{ position: 'top', fontSize: 10, fill: '#ccc', formatter: (v) => fmt(v, bgSlopeDecimals) }}>
                       {phaseRows.map((row, i) => {
                         const colors = ['#7986cb', '#9c27b0', '#26a69a']
                         return <Cell key={i} fill={colors[i % colors.length]} />
@@ -1553,12 +1584,12 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                   <ComposedChart data={intensityRows} margin={{ top: 20, right: 50, left: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
                     <XAxis dataKey="zone" tick={{ fontSize: 11, fill: '#aaa' }} />
-                    <YAxis yAxisId="sd" orientation="left" tick={{ fontSize: 11, fill: '#aaa' }} label={{ value: 'BG SD (mmol/L)', angle: -90, position: 'insideLeft', offset: 10, style: { fontSize: 10, fill: '#aaa' } }} />
-                    <YAxis yAxisId="slope" orientation="right" tick={{ fontSize: 11, fill: '#aaa' }} label={{ value: 'BG slope (mmol/L/h)', angle: 90, position: 'insideRight', offset: 12, style: { fontSize: 10, fill: '#aaa' } }} />
+                    <YAxis yAxisId="sd" orientation="left" tick={{ fontSize: 11, fill: '#aaa' }} label={{ value: `BG SD (${glucoseUnit})`, angle: -90, position: 'insideLeft', offset: 10, style: { fontSize: 10, fill: '#aaa' } }} />
+                    <YAxis yAxisId="slope" orientation="right" tick={{ fontSize: 11, fill: '#aaa' }} label={{ value: `BG slope (${glucoseUnit}/h)`, angle: 90, position: 'insideRight', offset: 12, style: { fontSize: 10, fill: '#aaa' } }} />
                     <Tooltip />
                     <Legend wrapperStyle={{ fontSize: 11 }} />
-                    <Bar yAxisId="sd" dataKey="bg_std" name="BG SD" fill="#ef5b0c" barSize={24} />
-                    <Line yAxisId="slope" type="monotone" dataKey="bg_slope_per_hour" name="BG Slope" stroke="#0a8f8f" strokeWidth={2} dot={{ r: 3 }} />
+                    <Bar yAxisId="sd" dataKey="bg_std_display" name="BG SD" fill="#ef5b0c" barSize={24} />
+                    <Line yAxisId="slope" type="monotone" dataKey="bg_slope_display" name="BG Slope" stroke="#0a8f8f" strokeWidth={2} dot={{ r: 3 }} />
                     <text x="50%" y={12} textAnchor="middle" fill="#ccc" fontSize={12}>HR Zone vs Glucose Stability</text>
                   </ComposedChart>
                 </ResponsiveContainer>
@@ -1598,8 +1629,8 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                     <tr key={row.key || row.label}>
                       <td>{row.label || row.key || 'n/a'}</td>
                       <td>{fmt(row.count, 0)}</td>
-                      <td>{fmt(row.delta, 2, ' mmol/L')}</td>
-                      <td>{fmt(row.slope_per_hour, 2, ' mmol/L')}</td>
+                      <td>{formatGlucoseDelta(row.delta, glucoseUnit)}</td>
+                      <td>{formatGlucoseSlope(row.slope_per_hour, glucoseUnit)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1614,7 +1645,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                   <tr>
                     <th>HR Zone</th>
                     <th>Minutes</th>
-                    <th>BG Volatility</th>
+                    <th>BG Volatility ({glucoseUnit})</th>
                     <th>Slope / h</th>
                   </tr>
                 </thead>
@@ -1623,8 +1654,8 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                     <tr key={row.zone || 'zone'}>
                       <td>{row.zone || 'n/a'}</td>
                       <td>{fmt(row.minutes, 0)}</td>
-                      <td>{fmt(row.bg_std, 2)}</td>
-                      <td>{fmt(row.bg_slope_per_hour, 2)}</td>
+                      <td>{fmt(row.bg_std_display, bgSlopeDecimals)}</td>
+                      <td>{formatGlucoseSlope(row.bg_slope_per_hour, glucoseUnit)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1644,13 +1675,13 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
           <section className="card">
             <h2>Glucose Summary</h2>
             <div className="analysis-summary-row">
-              <span>Time in target (4.0–8.0 mmol/L):</span>
+              <span>Time in target ({formatGlucose(userSettings.target_low_mmol ?? 4.0, glucoseUnit, false)}–{formatGlucose(userSettings.target_high_mmol ?? 8.0, glucoseUnit)}):</span>
               <strong>{fmt(metrics.tir_pct, 0, '%')}</strong>
             </div>
             <div className="analysis-summary-row">
               <span>Glucose change:</span>
               <strong style={{ color: metrics.bg_delta < 0 ? '#1f8a5b' : metrics.bg_delta > 0 ? '#d16a00' : 'inherit' }}>
-                {metrics.bg_delta > 0 ? '+' : ''}{fmt(metrics.bg_delta, 1, ' mmol/L')}
+                {formatGlucoseDelta(metrics.bg_delta, glucoseUnit, true)}
               </strong>
             </div>
           </section>
@@ -1700,21 +1731,21 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                       : riskProfile.prewalk.assessment === 'contraindicated_cl' ? '#be2f2f'
                       : '#d16a00',
                   }}>
-                    {fmt(riskProfile.prewalk.bg_at_start, 1)} mmol/L
-                    {' '}({riskProfile.prewalk.assessment === 'optimal' ? 'in target 7–10'
+                    {formatGlucose(riskProfile.prewalk.bg_at_start, glucoseUnit)}
+                    {' '}({riskProfile.prewalk.assessment === 'optimal' ? `in target ${formatGlucose(7, glucoseUnit, false)}–${formatGlucose(10, glucoseUnit)}`
                       : riskProfile.prewalk.assessment === 'low' ? 'below target — hypo risk elevated'
                       : riskProfile.prewalk.assessment === 'contraindicated_cl' ? 'CL contraindication — delay walk until BG reduced'
                       : 'above target'})
                   </strong>
                 ) : (
-                  <strong>{fmt(riskProfile.prewalk.bg_at_start, 1)} mmol/L</strong>
+                  <strong>{formatGlucose(riskProfile.prewalk.bg_at_start, glucoseUnit)}</strong>
                 )
               ) : <strong>n/a</strong>}
             </div>
-            {hasInsulin && riskProfile.prewalk.assessment === 'contraindicated_cl' && (
+            {hasClosedLoop && riskProfile.prewalk.assessment === 'contraindicated_cl' && (
               <div style={{ margin: '0.4rem 0 0.6rem', padding: '0.5rem 0.7rem', background: 'rgba(190,47,47,0.08)', borderRadius: '4px', borderLeft: '3px solid #be2f2f' }}>
                 <strong style={{ color: '#be2f2f' }}>Closed-loop contraindication</strong>
-                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>Do not start walk until BG is below 15.0 mmol/L. Significant hyperglycaemia is a hard stop for closed-loop exercise (Zaharieva et al. 2020, Table 3).</span>
+                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>Do not start walk until BG is below {formatGlucose(15.0, glucoseUnit)}. Significant hyperglycaemia is a hard stop for closed-loop exercise (Zaharieva et al. 2020, Table 3).</span>
               </div>
             )}
             {hasInsulin && riskProfile.prewalk.iob_at_start != null && (
@@ -1741,11 +1772,11 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
               {riskProfile.during.drop_rate_mmol_h != null ? (
                 hasInsulin ? (
                   <strong style={{ color: riskProfile.during.drop_flag === 'rapid' ? '#be2f2f' : riskProfile.during.drop_flag === 'elevated' ? '#d16a00' : '#1f8a5b' }}>
-                    {fmt(riskProfile.during.drop_rate_mmol_h, 2)} mmol/L/h
+                    {formatGlucoseSlope(riskProfile.during.drop_rate_mmol_h, glucoseUnit)}
                     {riskProfile.during.drop_flag === 'rapid' ? ' — rapid, high hypo risk' : riskProfile.during.drop_flag === 'elevated' ? ' — elevated, monitor closely' : ' — within normal range'}
                   </strong>
                 ) : (
-                  <strong>{fmt(riskProfile.during.drop_rate_mmol_h, 2)} mmol/L/h</strong>
+                  <strong>{formatGlucoseSlope(riskProfile.during.drop_rate_mmol_h, glucoseUnit)}</strong>
                 )
               ) : <strong>n/a</strong>}
             </div>
@@ -1754,19 +1785,19 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
               <div className="analysis-summary-row" style={{ paddingLeft: '1rem', fontSize: '0.85rem', color: 'var(--text-muted)' }}>
                 <span>↳ First 30 min:</span>
                 <strong style={{ color: riskProfile.during.first_30_flag === 'rapid' ? '#be2f2f' : riskProfile.during.first_30_flag === 'elevated' ? '#d16a00' : 'inherit' }}>
-                  {fmt(riskProfile.during.first_30_drop_rate, 2)} mmol/L/h
+                  {formatGlucoseSlope(riskProfile.during.first_30_drop_rate, glucoseUnit)}
                   {riskProfile.during.first_30_flag === 'rapid' ? ' — rapid early descent' : ''}
                 </strong>
                 {riskProfile.during.rest_drop_rate != null && (
                   <span style={{ marginLeft: '0.5rem', color: 'var(--text-muted)' }}>
-                    · rest: {fmt(riskProfile.during.rest_drop_rate, 2)} mmol/L/h
+                    · rest: {formatGlucoseSlope(riskProfile.during.rest_drop_rate, glucoseUnit)}
                   </span>
                 )}
               </div>
             )}
             {hasInsulin && riskProfile.during.projected_hypo_min != null && riskProfile.during.drop_flag !== 'normal' && (
               <div className="analysis-summary-row">
-                <span>Projected hypo (3.9 mmol/L) from walk end:</span>
+                <span>Projected hypo ({formatGlucose(userSettings.hypo_threshold_mmol ?? 3.9, glucoseUnit)}) from walk end:</span>
                 <strong style={{ color: '#be2f2f' }}>
                   {riskProfile.during.projected_hypo_min < 60
                     ? `${riskProfile.during.projected_hypo_min} min`
@@ -1777,7 +1808,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             )}
             <div className="analysis-summary-row">
               <span>Post-walk BG:</span>
-              <strong>{riskProfile.during.bg_at_end != null ? `${fmt(riskProfile.during.bg_at_end, 1)} mmol/L` : 'n/a'}</strong>
+              <strong>{riskProfile.during.bg_at_end != null ? formatGlucose(riskProfile.during.bg_at_end, glucoseUnit) : 'n/a'}</strong>
             </div>
             <div className="analysis-summary-row">
               <span>Exercise intensity:</span>
@@ -1797,14 +1828,14 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
               <div style={{ marginTop: '0.6rem', padding: '0.5rem 0.7rem', background: 'rgba(209,106,0,0.08)', borderRadius: '4px', borderLeft: '3px solid #d16a00' }}>
                 <strong style={{ color: '#d16a00' }}>Mild post-exercise hyperglycaemia</strong>
                 <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>
-                  BG {fmt(riskProfile.during.bg_at_end, 1)} mmol/L at walk end (8–12 mmol/L range). Consider a 10–15 min low-intensity cool-down to reduce BG gradually before stopping (Scott et al. 2021).
+                  BG {formatGlucose(riskProfile.during.bg_at_end, glucoseUnit)} at walk end ({formatGlucose(8, glucoseUnit, false)}–{formatGlucose(12, glucoseUnit)} range). Consider a 10–15 min low-intensity cool-down to reduce BG gradually before stopping (Scott et al. 2021).
                 </span>
               </div>
             )}
             {hasInsulin && riskProfile.recovery.early_carb_trigger_met && (
               <div style={{ marginTop: '0.6rem', padding: '0.5rem 0.7rem', background: 'rgba(209,106,0,0.08)', borderRadius: '4px', borderLeft: '3px solid #d16a00' }}>
                 <strong style={{ color: '#d16a00' }}>Early-recovery carb trigger met</strong>
-                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>BG fell below 8.0 mmol/L within 2 h — carb intake recommended (Scott et al. 2021)</span>
+                <span style={{ fontSize: '0.85rem', marginLeft: '0.4rem' }}>BG fell below {formatGlucose(8.0, glucoseUnit)} within 2 h — carb intake recommended (Scott et al. 2021)</span>
               </div>
             )}
             {sensorGaps.length > 0 && (
@@ -1876,17 +1907,17 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                     <tr key={phase.key} style={{ color: hasInsulin && phase.hypos > 0 ? '#be2f2f' : undefined }}>
                       <td>{phase.label}</td>
                       <td>{phase.count || '—'}</td>
-                      <td>{phase.min_bg != null ? `${fmt(phase.min_bg, 1)} mmol/L` : '—'}</td>
-                      <td>{phase.mean_bg != null ? `${fmt(phase.mean_bg, 1)} mmol/L` : '—'}</td>
+                      <td>{phase.min_bg != null ? formatGlucose(phase.min_bg, glucoseUnit) : '—'}</td>
+                      <td>{phase.mean_bg != null ? formatGlucose(phase.mean_bg, glucoseUnit) : '—'}</td>
                       {hasInsulin && <td>{phase.hypos > 0 ? <strong style={{ color: '#be2f2f' }}>{phase.hypos}</strong> : (phase.count ? '0' : '—')}</td>}
-                      <td>{phase.slope_per_hour != null ? `${fmt(phase.slope_per_hour, 2)} mmol/L/h` : '—'}</td>
+                      <td>{phase.slope_per_hour != null ? formatGlucoseSlope(phase.slope_per_hour, glucoseUnit) : '—'}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           </>
-        ) : <p className="empty">No post-walk BG data in Carelink export for this period.</p>}
+        ) : <p className="empty">No post-walk BG data in telemetry export for this period.</p>}
       </section>
 
       {/* Next Walk Preparation */}
@@ -1900,7 +1931,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
             <div style={{ padding: '0.9rem 1rem', background: 'rgba(31,138,91,0.06)', borderRadius: '6px', borderLeft: '3px solid #1f8a5b' }}>
               <h3 style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '0.6rem', color: '#1f8a5b' }}>Before the walk</h3>
               <ul style={{ paddingLeft: '1.2rem', fontSize: '0.87rem', lineHeight: 1.65, margin: 0 }}>
-                <li>Target BG <strong>{riskProfile.nextWalk.target_bg_range[0]}–{riskProfile.nextWalk.target_bg_range[1]} mmol/L</strong> at walk start</li>
+                <li>Target BG <strong>{formatGlucose(riskProfile.nextWalk.target_bg_range[0], glucoseUnit, false)}–{formatGlucose(riskProfile.nextWalk.target_bg_range[1], glucoseUnit)}</strong> at walk start</li>
                 <li>Reduce basal by <strong>{riskProfile.nextWalk.basal_reduction_pct}%</strong> starting <strong>{riskProfile.nextWalk.basal_timing_min} min</strong> before</li>
                 <li>If taking a pre-walk bolus, reduce by <strong>{riskProfile.nextWalk.bolus_reduction_pct}%</strong> (intensity: <em style={{ textTransform: 'capitalize' }}>{riskProfile.nextWalk.intensity}</em>)</li>
                 <li>Prepare ~<strong>{riskProfile.nextWalk.carbs_per_hour_g} g carbs/h</strong>{riskProfile.nextWalk.total_carbs_g ? ` (~${riskProfile.nextWalk.total_carbs_g} g total based on duration)` : ''}</li>
@@ -1938,22 +1969,22 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
                 Riddell et al. 2017, Table 3
               </p>
             </div>
-            {riskProfile.nextWalk.cl_temp_target_mmol && (
+            {(hasClosedLoop || hasPump) && riskProfile.nextWalk.cl_temp_target_mmol && (
               <div style={{ padding: '0.9rem 1rem', background: 'rgba(8,114,184,0.06)', borderRadius: '6px', borderLeft: '3px solid #0872b8' }}>
                 <h3 style={{ fontSize: '0.9rem', fontWeight: 700, marginBottom: '0.6rem', color: '#0872b8' }}>
-                  780G SmartGuard — temp target
+                  Closed-loop / SmartGuard — temp target
                 </h3>
                 <ul style={{ paddingLeft: '1.2rem', fontSize: '0.87rem', lineHeight: 1.65, margin: 0 }}>
                   <li>
                     Raise CL target to{' '}
                     <strong>{riskProfile.nextWalk.cl_temp_target_mmol} mmol/L ({riskProfile.nextWalk.cl_temp_target_mgdl} mg/dL)</strong>{' '}
-                    in SmartGuard settings
+                    in closed-loop / SmartGuard settings
                   </li>
                   <li>
                     Set <strong>{riskProfile.nextWalk.cl_temp_start_min_before} min before</strong> starting activity
                   </li>
                   <li>
-                    Cancel when BG returns to your normal range (<strong>≤ {riskProfile.nextWalk.target_bg_range[1]} mmol/L</strong>) after the walk
+                    Cancel when BG returns to your normal range (<strong>≤ {formatGlucose(riskProfile.nextWalk.target_bg_range[1], glucoseUnit)}</strong>) after the walk
                   </li>
                 </ul>
                 <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.6rem', marginBottom: 0 }}>
@@ -1966,7 +1997,7 @@ export default function WalkAnalysisView({ walkId, insulinProfile, apiFetch, sha
               <ul style={{ paddingLeft: '1.2rem', fontSize: '0.87rem', lineHeight: 1.65, margin: 0 }}>
                 <li>Check BG immediately and every <strong>15 min</strong> for first hour</li>
                 <li>
-                  If BG &lt; 8.0 mmol/L: take <strong>15–20 g fast carbs</strong>{' '}
+                  If BG &lt; {formatGlucose(8.0, glucoseUnit)}: take <strong>15–20 g fast carbs</strong>{' '}
                   <span style={{ fontWeight: 400 }}>(mixed glucose + fructose — sports drink or fruit — restores liver glycogen faster than pure glucose for the same gram count; Scott et al. 2021)</span>
                 </li>
                 <li>Reduce bolus at first recovery meal by ~<strong>{riskProfile.nextWalk.recovery_bolus_reduction_pct}%</strong></li>
